@@ -86,11 +86,69 @@ Standard Error Response:
 {
   "success": false,
   "error": "Detailed error message here",
-  "code": "ERROR_CODE"  // e.g., 'INVALID_REQUEST', 'IMAGE_TOO_LARGE'
+  "code": "ERROR_CODE"
 }
-Common Error Codes:
 
-INVALID_REQUEST: Missing fields or bad format.
-IMAGE_TOO_LARGE: Image exceeds 5MB.
-UNSUPPORTED_FORMAT: Image must be JPEG, PNG, or WebP.
-ANALYSIS_FAILED: AI could not identify food.
+## Error Codes by Category
+
+### Input Validation Errors (HTTP 4xx)
+| Code | HTTP | Description | Frontend Action |
+|------|------|-------------|-----------------|
+| `INVALID_REQUEST` | 400 | Missing or malformed fields | Show form validation error |
+| `IMAGE_TOO_LARGE` | 413 | Image exceeds 5MB | Compress image before upload |
+| `UNSUPPORTED_FORMAT` | 415 | Must be JPEG, PNG, or WebP | Convert image format |
+
+### Food Analysis Errors (HTTP 422)
+| Code | HTTP | Description | Frontend Action |
+|------|------|-------------|-----------------|
+| `NOT_FOOD` | 422 | Image doesn't contain food | Show "Please take a photo of food" |
+| `IMAGE_TOO_BLURRY` | 422 | Image is blurry/unclear | Show "Please take a clearer photo" |
+| `MULTIPLE_FOODS` | 422 | Multiple items detected | Show "Please capture one item at a time" |
+| `LOW_CONFIDENCE` | 422 | AI can't identify the food | Show "Could not identify. Try a different angle" |
+| `ANALYSIS_FAILED` | 422 | Generic analysis failure | Show "Analysis failed. Please try again" |
+
+### Server Errors (HTTP 5xx)
+| Code | HTTP | Description | Frontend Action |
+|------|------|-------------|-----------------|
+| `AI_SERVICE_ERROR` | 503 | OpenAI temporarily unavailable | Show "Service busy. Please retry" |
+| `AI_CONFIG_ERROR` | 500 | Server misconfigured | Contact support |
+| `PARSE_ERROR` | 500 | AI response malformed | Retry, then contact support |
+| `RATE_LIMITED` | 429 | Too many requests | Implement backoff, retry later |
+
+## Frontend Error Handling Example
+
+```typescript
+const analyzeFood = async (deviceId: string, base64Image: string) => {
+  const response = await fetch(FOOD_ANALYSIS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId, image: base64Image }),
+  });
+
+  const result = await response.json();
+
+  if (!result.success) {
+    // Handle specific error codes
+    switch (result.code) {
+      case 'NOT_FOOD':
+        showToast('Please take a photo of food');
+        break;
+      case 'IMAGE_TOO_BLURRY':
+        showToast('Image is too blurry. Please try again');
+        break;
+      case 'IMAGE_TOO_LARGE':
+        showToast('Image is too large. Please use a smaller image');
+        break;
+      case 'AI_SERVICE_ERROR':
+        showToast('Service temporarily unavailable. Please retry');
+        break;
+      default:
+        showToast(result.error || 'Something went wrong');
+    }
+    return null;
+  }
+
+  return result.nutrition as NutritionData;
+};
+```
+

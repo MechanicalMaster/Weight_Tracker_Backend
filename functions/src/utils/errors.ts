@@ -59,6 +59,48 @@ export const errors = {
     ),
   analysisFailed: (reason: string) =>
     new ApiError(422, `Food analysis failed: ${reason}`, "ANALYSIS_FAILED"),
+  notFood: (description?: string) =>
+    new ApiError(
+      422,
+      description || "The image does not appear to contain food",
+      "NOT_FOOD",
+    ),
+  imageTooBlurry: () =>
+    new ApiError(
+      422,
+      "The image is too blurry or unclear to analyze",
+      "IMAGE_TOO_BLURRY",
+    ),
+  multipleFoods: () =>
+    new ApiError(
+      422,
+      "Multiple food items detected. Please capture one item at a time",
+      "MULTIPLE_FOODS",
+    ),
+  lowConfidence: () =>
+    new ApiError(
+      422,
+      "Could not confidently identify the food. Try a clearer photo",
+      "LOW_CONFIDENCE",
+    ),
+  aiServiceError: () =>
+    new ApiError(
+      503,
+      "AI service temporarily unavailable. Please try again",
+      "AI_SERVICE_ERROR",
+    ),
+  aiConfigError: () =>
+    new ApiError(
+      500,
+      "AI service configuration error",
+      "AI_CONFIG_ERROR",
+    ),
+  parseError: () =>
+    new ApiError(
+      500,
+      "Failed to parse AI response",
+      "PARSE_ERROR",
+    ),
   rateLimited: () =>
     new ApiError(429, "Too many requests", "RATE_LIMITED"),
   internalError: () =>
