@@ -23,6 +23,7 @@ export const registerDeviceFunction = onRequest(
   {
     memory: FUNCTION_CONFIG.MEMORY,
     cors: true,
+    invoker: "public",
   },
   registerDevice,
 );
@@ -55,6 +56,7 @@ export const analyzeFoodImageFunction = onRequest(
     memory: FUNCTION_CONFIG.ANALYSIS_MEMORY,
     timeoutSeconds: 60,
     cors: true,
+    invoker: "public",
   },
   analyzeFoodImage,
 );

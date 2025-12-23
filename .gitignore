@@ -15,6 +15,7 @@ pubsub-debug.log
 .env.local
 .env.*.local
 *.env
+.env.*
 
 # IDE
 .idea/
