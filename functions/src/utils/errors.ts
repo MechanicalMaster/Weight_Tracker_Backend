@@ -105,4 +105,13 @@ export const errors = {
     new ApiError(429, "Too many requests", "RATE_LIMITED"),
   internalError: () =>
     new ApiError(500, "Internal server error", "INTERNAL_ERROR"),
+  // Auth & Credits errors
+  unauthorized: (message?: string) =>
+    new ApiError(401, message || "Unauthorized", "UNAUTHORIZED"),
+  insufficientCredits: () =>
+    new ApiError(402, "Insufficient AI credits", "INSUFFICIENT_CREDITS"),
+  backupNotFound: () =>
+    new ApiError(404, "No backup found for this user", "BACKUP_NOT_FOUND"),
+  storageError: (message?: string) =>
+    new ApiError(500, message || "Storage operation failed", "STORAGE_ERROR"),
 };

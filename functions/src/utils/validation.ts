@@ -15,21 +15,26 @@ export const deviceRegistrationSchema = z.object({
   }),
 });
 
-// Food analysis validation schema
+// Food analysis validation schema (deviceId now optional, auth provides uid)
 export const foodAnalysisSchema = z.object({
-  deviceId: z
-    .string()
-    .min(1, "deviceId is required")
-    .max(256, "deviceId too long"),
   image: z
     .string()
     .min(1, "image is required")
     .optional(),
 });
 
+// Backup data validation schema
+export const backupSchema = z.object({
+  weightEntries: z.array(z.unknown()).optional(),
+  foodLogs: z.array(z.unknown()).optional(),
+  streaks: z.record(z.unknown()).optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+
 // Type exports from schemas
 export type DeviceRegistrationInput = z.infer<typeof deviceRegistrationSchema>;
 export type FoodAnalysisInput = z.infer<typeof foodAnalysisSchema>;
+export type BackupInput = z.infer<typeof backupSchema>;
 
 // Validation helper
 export function validateInput<T>(
@@ -45,3 +50,4 @@ export function validateInput<T>(
     .join(", ");
   return { success: false, error: errorMessage };
 }
+

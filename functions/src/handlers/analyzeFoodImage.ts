@@ -2,9 +2,11 @@ import { Request, Response } from "express";
 import { logger } from "firebase-functions/v2";
 import Busboy from "busboy";
 import { analyzeFood } from "../services/vision";
+import { deductCredit } from "../services/user";
 import { foodAnalysisSchema, validateInput } from "../utils/validation";
 import { handleError, errors } from "../utils/errors";
 import { LIMITS, VISION_CONFIG } from "../config/constants";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
 
 // Extend Express Request to include rawBody (added by Firebase Functions)
 interface FirebaseRequest extends Request {
@@ -12,7 +14,6 @@ interface FirebaseRequest extends Request {
 }
 
 interface ParsedRequest {
-  deviceId: string;
   imageBase64: string;
   mimeType: string;
 }
@@ -28,16 +29,9 @@ function parseMultipartRequest(req: FirebaseRequest): Promise<ParsedRequest> {
       },
     });
 
-    let deviceId = "";
     let imageBuffer: Buffer | null = null;
     let mimeType = "";
     let fileLimitExceeded = false;
-
-    bb.on("field", (fieldname: string, val: string) => {
-      if (fieldname === "deviceId") {
-        deviceId = val;
-      }
-    });
 
     bb.on("file", (
       _fieldname: string,
@@ -71,13 +65,7 @@ function parseMultipartRequest(req: FirebaseRequest): Promise<ParsedRequest> {
         return;
       }
 
-      if (!deviceId) {
-        reject(errors.invalidRequest("deviceId is required"));
-        return;
-      }
-
       resolve({
-        deviceId,
         imageBase64: imageBuffer.toString("base64"),
         mimeType,
       });
@@ -102,14 +90,13 @@ function parseJsonRequest(req: Request): ParsedRequest {
     throw errors.invalidRequest(validation.error);
   }
 
-  const { deviceId, image } = validation.data;
+  const { image } = validation.data;
 
   if (!image) {
     throw errors.invalidRequest("image is required");
   }
 
   return {
-    deviceId,
     imageBase64: image,
     mimeType: "image/jpeg", // Assume JPEG for base64
   };
@@ -118,7 +105,14 @@ function parseJsonRequest(req: Request): ParsedRequest {
 // Create a mutable copy of supported formats for includes check
 const supportedFormats: string[] = [...VISION_CONFIG.SUPPORTED_FORMATS];
 
-export async function analyzeFoodImage(req: FirebaseRequest, res: Response): Promise<void> {
+/**
+ * Food Image Analysis Handler
+ * Requires authentication and deducts 1 credit per analysis
+ */
+export async function analyzeFoodImage(
+  req: FirebaseRequest & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
   try {
     // Only allow POST
     if (req.method !== "POST") {
@@ -128,6 +122,24 @@ export async function analyzeFoodImage(req: FirebaseRequest, res: Response): Pro
       });
       return;
     }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    // If verifyAuth responded with error, stop here
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Analyzing food image for user: ${uid}`);
+
+    // Deduct credit before analysis (throws if insufficient)
+    const remainingCredits = await deductCredit(uid);
+    logger.info(`Credit deducted, remaining: ${remainingCredits}`);
 
     let parsed: ParsedRequest;
 
@@ -148,16 +160,16 @@ export async function analyzeFoodImage(req: FirebaseRequest, res: Response): Pro
       throw errors.unsupportedFormat([...VISION_CONFIG.SUPPORTED_FORMATS]);
     }
 
-    logger.info(`Analyzing food image for device: ${parsed.deviceId}`);
-
     // Analyze the food image
     const nutrition = await analyzeFood(parsed.imageBase64);
 
     res.status(200).json({
       success: true,
       nutrition,
+      creditsRemaining: remainingCredits,
     });
   } catch (error) {
     handleError(error, res);
   }
 }
+
