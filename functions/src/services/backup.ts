@@ -1,112 +1,154 @@
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
 import { logger } from "firebase-functions/v2";
 import * as zlib from "zlib";
 import { promisify } from "util";
 import { errors } from "../utils/errors";
+import { BACKUP_CONFIG } from "../config/constants";
+import type { BackupPayload } from "../types";
 
 const db = getFirestore();
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
-// Current backup version
+// Increment only if backup format changes
 const BACKUP_VERSION = 1;
 
 /**
- * Backup document structure
+ * Firestore backup metadata (NO payload here)
  */
 export interface BackupDocument {
-    version: number;
-    data: string; // Compressed JSON
-    updatedAt: Timestamp;
+  version: number;
+  storagePath: string;
+  sizeBytes: number;
+  updatedAt: Timestamp;
 }
 
 /**
- * Backup payload structure (what client sends)
+ * Resolve Cloud Storage bucket explicitly
  */
-export interface BackupPayload {
-    weightEntries?: unknown[];
-    foodLogs?: unknown[];
-    streaks?: Record<string, unknown>;
-    metadata?: Record<string, unknown>;
+function getBucket() {
+  const bucketName = BACKUP_CONFIG.STORAGE_BUCKET;
+  if (!bucketName) {
+    throw new Error("STORAGE_BUCKET environment variable is not set");
+  }
+  return getStorage().bucket(bucketName);
+}
+
+/**
+ * Storage path for the current backup
+ * Overwrites on each backup
+ */
+function getStoragePath(uid: string): string {
+  return `${BACKUP_CONFIG.STORAGE_PATH_PREFIX}/${uid}/backups/${BACKUP_CONFIG.BACKUP_FILENAME}`;
 }
 
 /**
  * Save backup for a user
- * Compresses the data and stores it in Firestore
+ * 1) Compress JSON
+ * 2) Upload to Cloud Storage
+ * 3) Store metadata in Firestore
  */
 export async function saveBackup(
   uid: string,
   payload: BackupPayload,
 ): Promise<void> {
-  const jsonData = JSON.stringify(payload);
-  const compressed = await gzip(Buffer.from(jsonData, "utf-8"));
-  const base64Data = compressed.toString("base64");
+  const json = JSON.stringify(payload);
+  const compressed = await gzip(Buffer.from(json, "utf-8"));
 
-  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
+  const storagePath = getStoragePath(uid);
+  const bucket = getBucket();
+  const file = bucket.file(storagePath);
 
-  const backupDoc: BackupDocument = {
+  // Upload blob FIRST (atomicity guarantee)
+  await file.save(compressed, {
+    contentType: "application/gzip",
+    metadata: { contentEncoding: "gzip" },
+  });
+
+  logger.info("Backup uploaded to Cloud Storage", {
+    uid,
+    storagePath,
+    sizeBytes: compressed.length,
+  });
+
+  // Write Firestore metadata ONLY
+  const backupRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("backup")
+    .doc("current");
+
+  await backupRef.set({
     version: BACKUP_VERSION,
-    data: base64Data,
+    storagePath,
+    sizeBytes: compressed.length,
     updatedAt: Timestamp.now(),
-  };
+  });
 
-  await backupRef.set(backupDoc);
-
-  logger.info(`Saved backup for user ${uid}, size: ${base64Data.length} bytes`);
+  logger.info("Backup metadata written", { uid });
 }
 
 /**
  * Load backup for a user
- * Decompresses and returns the backup data
+ * Reads metadata → downloads blob → decompresses
  */
 export async function loadBackup(uid: string): Promise<BackupPayload> {
-  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
-  const backupDoc = await backupRef.get();
+  const backupRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("backup")
+    .doc("current");
 
-  if (!backupDoc.exists) {
+  const snap = await backupRef.get();
+  if (!snap.exists) {
     throw errors.backupNotFound();
   }
 
-  const backup = backupDoc.data() as BackupDocument;
+  const backup = snap.data() as BackupDocument;
 
-  // Decompress the data
-  const compressed = Buffer.from(backup.data, "base64");
-  const decompressed = await gunzip(compressed);
-  const jsonData = decompressed.toString("utf-8");
+  const bucket = getBucket();
+  const file = bucket.file(backup.storagePath);
 
-  const payload = JSON.parse(jsonData) as BackupPayload;
+  const [contents] = await file.download();
+  const decompressed = await gunzip(contents);
 
-  logger.info(`Loaded backup for user ${uid}, version: ${backup.version}`);
+  logger.info("Backup loaded from Cloud Storage", {
+    uid,
+    version: backup.version,
+  });
 
-  return payload;
+  return JSON.parse(decompressed.toString("utf-8"));
 }
 
 /**
- * Check if backup exists for user
- */
-export async function hasBackup(uid: string): Promise<boolean> {
-  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
-  const backupDoc = await backupRef.get();
-  return backupDoc.exists;
-}
-
-/**
- * Get backup metadata without loading full data
+ * Get backup metadata only (no payload)
  */
 export async function getBackupInfo(
   uid: string,
-): Promise<{ exists: boolean; version?: number; updatedAt?: Date }> {
-  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
-  const backupDoc = await backupRef.get();
+): Promise<{
+  exists: boolean;
+  version?: number;
+  updatedAt?: Date;
+  sizeBytes?: number;
+}> {
+  const backupRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("backup")
+    .doc("current");
 
-  if (!backupDoc.exists) {
+  const snap = await backupRef.get();
+  if (!snap.exists) {
     return { exists: false };
   }
 
-  const backup = backupDoc.data() as BackupDocument;
+  const backup = snap.data() as BackupDocument;
+
   return {
     exists: true,
     version: backup.version,
     updatedAt: backup.updatedAt.toDate(),
+    sizeBytes: backup.sizeBytes,
   };
 }

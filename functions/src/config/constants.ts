@@ -29,3 +29,10 @@ export const FUNCTION_CONFIG = {
   MEMORY: "256MiB" as const,
   ANALYSIS_MEMORY: "512MiB" as const,
 } as const;
+
+export const BACKUP_CONFIG = {
+  STORAGE_BUCKET: process.env.STORAGE_BUCKET || "",
+  STORAGE_PATH_PREFIX: "users",
+  BACKUP_FILENAME: "current.gz",
+} as const;
+

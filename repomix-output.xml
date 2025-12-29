@@ -1,0 +1,2473 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.github/
+  workflows/
+    deploy.yml
+functions/
+  src/
+    config/
+      constants.ts
+    handlers/
+      analyzeFoodImage.ts
+      backup.ts
+      credits.ts
+      registerDevice.ts
+      sendDailyNudge.ts
+    middleware/
+      auth.ts
+    services/
+      backup.ts
+      fcm.ts
+      firestore.ts
+      user.ts
+      vision.ts
+    types/
+      index.ts
+    utils/
+      errors.ts
+      validation.ts
+    index.ts
+  .eslintrc.js
+  package.json
+  tsconfig.json
+.firebaserc
+.gitignore
+firebase.json
+firestore.indexes.json
+firestore.rules
+int.md
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".github/workflows/deploy.yml">
+name: Deploy to Firebase
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  lint-and-build:
+    name: Lint and Build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: functions
+
+      - name: Run linter
+        run: npm run lint
+        working-directory: functions
+
+      - name: Build TypeScript
+        run: npm run build
+        working-directory: functions
+
+  deploy:
+    name: Deploy to Firebase
+    needs: lint-and-build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: functions
+
+      - name: Build TypeScript
+        run: npm run build
+        working-directory: functions
+
+      - name: Deploy to Firebase
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only functions,firestore:rules
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+</file>
+
+<file path="functions/src/config/constants.ts">
+// Configuration constants
+
+export const COLLECTIONS = {
+  DEVICES: "devices",
+  NUDGES: "nudges",
+} as const;
+
+export const LIMITS = {
+  MAX_IMAGE_SIZE_BYTES: 5 * 1024 * 1024, // 5MB
+  DEVICE_ACTIVE_DAYS: 30, // Consider device active if seen within this many days
+  FCM_BATCH_SIZE: 500, // Max devices per FCM batch
+} as const;
+
+export const NUDGE_CONFIG = {
+  DEFAULT_TITLE: "Time to log your weight! ⚖️",
+  DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
+} as const;
+
+export const VISION_CONFIG = {
+  MODEL: "gpt-4o",
+  MAX_TOKENS: 1024,
+  TIMEOUT_MS: 60000,
+  SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
+} as const;
+
+export const FUNCTION_CONFIG = {
+  REGION: "us-central1",
+  TIMEOUT_SECONDS: 60,
+  MEMORY: "256MiB" as const,
+  ANALYSIS_MEMORY: "512MiB" as const,
+} as const;
+</file>
+
+<file path="functions/src/handlers/backup.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { saveBackup, loadBackup, getBackupInfo } from "../services/backup";
+import { backupSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+
+/**
+ * POST /backup
+ * Save user data backup
+ */
+export async function createBackup(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Creating backup for user: ${uid}`);
+
+    // Validate input
+    const validation = validateInput(backupSchema, req.body);
+    if (!validation.success) {
+      throw errors.invalidRequest(validation.error);
+    }
+
+    await saveBackup(uid, validation.data);
+
+    res.status(200).json({
+      success: true,
+      message: "Backup saved successfully",
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+
+/**
+ * POST /restore
+ * Restore user data from backup
+ */
+export async function restoreBackup(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Restoring backup for user: ${uid}`);
+
+    const backup = await loadBackup(uid);
+
+    res.status(200).json({
+      success: true,
+      data: backup,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+
+/**
+ * GET /backup-status
+ * Check if backup exists and get metadata
+ */
+export async function getBackupStatus(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    if (req.method !== "GET") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    const info = await getBackupInfo(uid);
+
+    res.status(200).json({
+      success: true,
+      ...info,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/handlers/credits.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { getCredits, getOrCreateUser } from "../services/user";
+import { handleError } from "../utils/errors";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+
+/**
+ * GET /credits
+ * Get current user's credit balance
+ */
+export async function getCreditsHandler(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    if (req.method !== "GET") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Getting credits for user: ${uid}`);
+
+    const credits = await getCredits(uid);
+
+    res.status(200).json({
+      success: true,
+      credits,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+
+/**
+ * GET /user/me
+ * Get current user profile including credits
+ */
+export async function getUserProfile(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    if (req.method !== "GET") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Getting profile for user: ${uid}`);
+
+    const userData = await getOrCreateUser(uid);
+
+    res.status(200).json({
+      success: true,
+      user: {
+        uid,
+        aiCredits: userData.aiCredits,
+        totalGranted: userData.totalGranted,
+        totalUsed: userData.totalUsed,
+        createdAt: userData.createdAt.toDate().toISOString(),
+        lastActiveAt: userData.lastActiveAt.toDate().toISOString(),
+      },
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/handlers/registerDevice.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { upsertDevice } from "../services/firestore";
+import { deviceRegistrationSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+
+export async function registerDevice(req: Request, res: Response): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    // Validate input
+    const validation = validateInput(deviceRegistrationSchema, req.body);
+    if (!validation.success) {
+      throw errors.invalidRequest(validation.error);
+    }
+
+    const { deviceId, fcmToken, platform } = validation.data;
+
+    logger.info(`Registering device: ${deviceId}`, { platform });
+
+    // Upsert device in Firestore
+    await upsertDevice(deviceId, fcmToken, platform);
+
+    res.status(200).json({
+      success: true,
+      message: "Device registered successfully",
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/handlers/sendDailyNudge.ts">
+import { logger } from "firebase-functions/v2";
+import { getActiveDevices, logNudge } from "../services/firestore";
+import { sendBatchNotifications } from "../services/fcm";
+import { NUDGE_CONFIG } from "../config/constants";
+
+export async function sendDailyNudge(): Promise<void> {
+  logger.info("Starting daily nudge job");
+
+  try {
+    // Get all active devices
+    const devices = await getActiveDevices();
+    logger.info(`Found ${devices.length} active devices`);
+
+    if (devices.length === 0) {
+      logger.info("No active devices to notify");
+      return;
+    }
+
+    // Send notifications
+    const results = await sendBatchNotifications(
+      devices,
+      NUDGE_CONFIG.DEFAULT_TITLE,
+      NUDGE_CONFIG.DEFAULT_BODY,
+    );
+
+    // Log each nudge result
+    const logPromises = results.map((result) =>
+      logNudge({
+        deviceId: result.deviceId,
+        status: result.success ? "success" : "failed",
+        title: NUDGE_CONFIG.DEFAULT_TITLE,
+        body: NUDGE_CONFIG.DEFAULT_BODY,
+        error: result.error,
+      }),
+    );
+
+    await Promise.all(logPromises);
+
+    const successCount = results.filter((r) => r.success).length;
+    logger.info(`Daily nudge complete: ${successCount}/${results.length} successful`);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error(`Daily nudge failed: ${errorMessage}`);
+    throw error;
+  }
+}
+</file>
+
+<file path="functions/src/middleware/auth.ts">
+import { Request, Response, NextFunction } from "express";
+import { getAuth } from "firebase-admin/auth";
+import { logger } from "firebase-functions/v2";
+import { errors } from "../utils/errors";
+
+/**
+ * Extended request with authenticated user info
+ * uid is optional in type definition because it's added at runtime
+ */
+export interface AuthenticatedRequest extends Request {
+  uid?: string;
+  rawBody?: Buffer;
+}
+
+/**
+ * Middleware to verify Firebase ID token
+ * Extracts uid from the token and attaches it to the request
+ */
+export async function verifyAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    const error = errors.unauthorized("Missing or invalid Authorization header");
+    res.status(error.statusCode).json({
+      success: false,
+      error: error.message,
+      code: error.code,
+    });
+    return;
+  }
+
+  const idToken = authHeader.split("Bearer ")[1];
+
+  try {
+    const decodedToken = await getAuth().verifyIdToken(idToken);
+    (req as AuthenticatedRequest).uid = decodedToken.uid;
+    next();
+  } catch (err) {
+    logger.warn("Failed to verify auth token", { error: err });
+    const error = errors.unauthorized("Invalid or expired token");
+    res.status(error.statusCode).json({
+      success: false,
+      error: error.message,
+      code: error.code,
+    });
+  }
+}
+
+/**
+ * Optional auth middleware - attaches uid if token is valid, continues if not
+ */
+export async function optionalAuth(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const idToken = authHeader.split("Bearer ")[1];
+    try {
+      const decodedToken = await getAuth().verifyIdToken(idToken);
+      (req as AuthenticatedRequest).uid = decodedToken.uid;
+    } catch {
+      logger.debug("Optional auth failed, continuing without uid");
+    }
+  }
+
+  next();
+}
+</file>
+
+<file path="functions/src/services/backup.ts">
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { logger } from "firebase-functions/v2";
+import * as zlib from "zlib";
+import { promisify } from "util";
+import { errors } from "../utils/errors";
+
+const db = getFirestore();
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+
+// Current backup version
+const BACKUP_VERSION = 1;
+
+/**
+ * Backup document structure
+ */
+export interface BackupDocument {
+    version: number;
+    data: string; // Compressed JSON
+    updatedAt: Timestamp;
+}
+
+/**
+ * Backup payload structure (what client sends)
+ */
+export interface BackupPayload {
+    weightEntries?: unknown[];
+    foodLogs?: unknown[];
+    streaks?: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+}
+
+/**
+ * Save backup for a user
+ * Compresses the data and stores it in Firestore
+ */
+export async function saveBackup(
+  uid: string,
+  payload: BackupPayload,
+): Promise<void> {
+  const jsonData = JSON.stringify(payload);
+  const compressed = await gzip(Buffer.from(jsonData, "utf-8"));
+  const base64Data = compressed.toString("base64");
+
+  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
+
+  const backupDoc: BackupDocument = {
+    version: BACKUP_VERSION,
+    data: base64Data,
+    updatedAt: Timestamp.now(),
+  };
+
+  await backupRef.set(backupDoc);
+
+  logger.info(`Saved backup for user ${uid}, size: ${base64Data.length} bytes`);
+}
+
+/**
+ * Load backup for a user
+ * Decompresses and returns the backup data
+ */
+export async function loadBackup(uid: string): Promise<BackupPayload> {
+  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
+  const backupDoc = await backupRef.get();
+
+  if (!backupDoc.exists) {
+    throw errors.backupNotFound();
+  }
+
+  const backup = backupDoc.data() as BackupDocument;
+
+  // Decompress the data
+  const compressed = Buffer.from(backup.data, "base64");
+  const decompressed = await gunzip(compressed);
+  const jsonData = decompressed.toString("utf-8");
+
+  const payload = JSON.parse(jsonData) as BackupPayload;
+
+  logger.info(`Loaded backup for user ${uid}, version: ${backup.version}`);
+
+  return payload;
+}
+
+/**
+ * Check if backup exists for user
+ */
+export async function hasBackup(uid: string): Promise<boolean> {
+  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
+  const backupDoc = await backupRef.get();
+  return backupDoc.exists;
+}
+
+/**
+ * Get backup metadata without loading full data
+ */
+export async function getBackupInfo(
+  uid: string,
+): Promise<{ exists: boolean; version?: number; updatedAt?: Date }> {
+  const backupRef = db.collection("users").doc(uid).collection("backup").doc("current");
+  const backupDoc = await backupRef.get();
+
+  if (!backupDoc.exists) {
+    return { exists: false };
+  }
+
+  const backup = backupDoc.data() as BackupDocument;
+  return {
+    exists: true,
+    version: backup.version,
+    updatedAt: backup.updatedAt.toDate(),
+  };
+}
+</file>
+
+<file path="functions/src/services/fcm.ts">
+import { admin } from "./firestore";
+import { logger } from "firebase-functions/v2";
+import { LIMITS } from "../config/constants";
+import { DeviceDocument } from "../types";
+
+interface SendResult {
+    deviceId: string;
+    success: boolean;
+    error?: string;
+}
+
+export async function sendPushNotification(
+  fcmToken: string,
+  title: string,
+  body: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: {
+        title,
+        body,
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "weight_reminders",
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: "default",
+            badge: 1,
+          },
+        },
+      },
+    });
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.warn(`FCM send failed: ${errorMessage}`);
+    return { success: false, error: errorMessage };
+  }
+}
+
+export async function sendBatchNotifications(
+  devices: DeviceDocument[],
+  title: string,
+  body: string,
+): Promise<SendResult[]> {
+  const results: SendResult[] = [];
+
+  // Process in batches to respect FCM limits
+  for (let i = 0; i < devices.length; i += LIMITS.FCM_BATCH_SIZE) {
+    const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
+
+    const batchPromises = batch.map(async (device) => {
+      const result = await sendPushNotification(device.fcmToken, title, body);
+      return {
+        deviceId: device.deviceId,
+        success: result.success,
+        error: result.error,
+      };
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+  }
+
+  const successCount = results.filter((r) => r.success).length;
+  const failCount = results.length - successCount;
+  logger.info(`Batch send complete: ${successCount} success, ${failCount} failed`);
+
+  return results;
+}
+</file>
+
+<file path="functions/src/services/firestore.ts">
+import * as admin from "firebase-admin";
+import { logger } from "firebase-functions/v2";
+import { COLLECTIONS, LIMITS } from "../config/constants";
+import { DeviceDocument, NudgeDocument } from "../types";
+
+// Initialize Firebase Admin if not already initialized
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+
+const db = admin.firestore();
+
+// Device operations
+export async function upsertDevice(
+  deviceId: string,
+  fcmToken: string,
+  platform: "ios" | "android",
+): Promise<void> {
+  const deviceRef = db.collection(COLLECTIONS.DEVICES).doc(deviceId);
+  const now = admin.firestore.Timestamp.now();
+
+  const deviceDoc = await deviceRef.get();
+
+  if (deviceDoc.exists) {
+    // Update existing device
+    await deviceRef.update({
+      fcmToken,
+      platform,
+      lastSeenAt: now,
+    });
+    logger.info(`Updated device: ${deviceId}`);
+  } else {
+    // Create new device
+    const newDevice: DeviceDocument = {
+      deviceId,
+      fcmToken,
+      platform,
+      createdAt: now,
+      lastSeenAt: now,
+    };
+    await deviceRef.set(newDevice);
+    logger.info(`Registered new device: ${deviceId}`);
+  }
+}
+
+export async function getActiveDevices(): Promise<DeviceDocument[]> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - LIMITS.DEVICE_ACTIVE_DAYS);
+  const cutoffTimestamp = admin.firestore.Timestamp.fromDate(cutoffDate);
+
+  const snapshot = await db
+    .collection(COLLECTIONS.DEVICES)
+    .where("lastSeenAt", ">=", cutoffTimestamp)
+    .get();
+
+  return snapshot.docs.map((doc) => doc.data() as DeviceDocument);
+}
+
+// Nudge operations
+export async function logNudge(nudge: Omit<NudgeDocument, "sentAt">): Promise<void> {
+  const nudgeData: NudgeDocument = {
+    ...nudge,
+    sentAt: admin.firestore.Timestamp.now(),
+  };
+
+  await db.collection(COLLECTIONS.NUDGES).add(nudgeData);
+  logger.info(`Logged nudge for device: ${nudge.deviceId}`, {
+    status: nudge.status,
+  });
+}
+
+export { db, admin };
+</file>
+
+<file path="functions/src/services/user.ts">
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { logger } from "firebase-functions/v2";
+import { errors } from "../utils/errors";
+
+const db = getFirestore();
+
+// Default free credits for new users
+const DEFAULT_FREE_CREDITS = 20;
+
+/**
+ * User document structure
+ */
+export interface UserDocument {
+    aiCredits: number;
+    totalGranted: number;
+    totalUsed: number;
+    createdAt: Timestamp;
+    lastActiveAt: Timestamp;
+}
+
+/**
+ * Initialize a new user with free credits
+ * Called on first authentication
+ */
+export async function initializeUser(uid: string): Promise<UserDocument> {
+  const userRef = db.collection("users").doc(uid);
+
+  const existingUser = await userRef.get();
+  if (existingUser.exists) {
+    logger.info(`User ${uid} already exists, returning existing data`);
+    return existingUser.data() as UserDocument;
+  }
+
+  const now = Timestamp.now();
+  const userData: UserDocument = {
+    aiCredits: DEFAULT_FREE_CREDITS,
+    totalGranted: DEFAULT_FREE_CREDITS,
+    totalUsed: 0,
+    createdAt: now,
+    lastActiveAt: now,
+  };
+
+  await userRef.set(userData);
+  logger.info(`Initialized new user ${uid} with ${DEFAULT_FREE_CREDITS} credits`);
+
+  return userData;
+}
+
+/**
+ * Get or create user data
+ */
+export async function getOrCreateUser(uid: string): Promise<UserDocument> {
+  const userRef = db.collection("users").doc(uid);
+  const userDoc = await userRef.get();
+
+  if (!userDoc.exists) {
+    return initializeUser(uid);
+  }
+
+  // Update last active timestamp
+  await userRef.update({ lastActiveAt: FieldValue.serverTimestamp() });
+
+  return userDoc.data() as UserDocument;
+}
+
+/**
+ * Get current credit balance
+ */
+export async function getCredits(uid: string): Promise<number> {
+  const user = await getOrCreateUser(uid);
+  return user.aiCredits;
+}
+
+/**
+ * Deduct one credit from user balance
+ * Uses transaction to prevent race conditions
+ * Throws INSUFFICIENT_CREDITS if balance is 0
+ */
+export async function deductCredit(uid: string): Promise<number> {
+  const userRef = db.collection("users").doc(uid);
+
+  const newBalance = await db.runTransaction(async (transaction) => {
+    const userDoc = await transaction.get(userRef);
+
+    if (!userDoc.exists) {
+      // Initialize user first
+      const now = Timestamp.now();
+      const userData: UserDocument = {
+        aiCredits: DEFAULT_FREE_CREDITS,
+        totalGranted: DEFAULT_FREE_CREDITS,
+        totalUsed: 0,
+        createdAt: now,
+        lastActiveAt: now,
+      };
+      transaction.set(userRef, userData);
+      // Deduct one credit
+      transaction.update(userRef, {
+        aiCredits: DEFAULT_FREE_CREDITS - 1,
+        totalUsed: 1,
+        lastActiveAt: FieldValue.serverTimestamp(),
+      });
+      return DEFAULT_FREE_CREDITS - 1;
+    }
+
+    const userData = userDoc.data() as UserDocument;
+
+    if (userData.aiCredits <= 0) {
+      throw errors.insufficientCredits();
+    }
+
+    const newCredits = userData.aiCredits - 1;
+    transaction.update(userRef, {
+      aiCredits: newCredits,
+      totalUsed: FieldValue.increment(1),
+      lastActiveAt: FieldValue.serverTimestamp(),
+    });
+
+    return newCredits;
+  });
+
+  logger.info(`Deducted credit for user ${uid}, remaining: ${newBalance}`);
+  return newBalance;
+}
+
+/**
+ * Add credits to user balance (for future admin/payment use)
+ */
+export async function addCredits(uid: string, amount: number): Promise<number> {
+  const userRef = db.collection("users").doc(uid);
+
+  await userRef.update({
+    aiCredits: FieldValue.increment(amount),
+    totalGranted: FieldValue.increment(amount),
+    lastActiveAt: FieldValue.serverTimestamp(),
+  });
+
+  const updated = await userRef.get();
+  const credits = (updated.data() as UserDocument).aiCredits;
+
+  logger.info(`Added ${amount} credits to user ${uid}, new balance: ${credits}`);
+  return credits;
+}
+</file>
+
+<file path="functions/src/types/index.ts">
+// Type definitions for the weight-tracking backend
+
+// Device registration types
+export interface DeviceRegistrationRequest {
+    deviceId: string;
+    fcmToken: string;
+    platform: "ios" | "android";
+}
+
+export interface DeviceDocument {
+    deviceId: string;
+    fcmToken: string;
+    platform: "ios" | "android";
+    createdAt: FirebaseFirestore.Timestamp;
+    lastSeenAt: FirebaseFirestore.Timestamp;
+}
+
+export interface DeviceRegistrationResponse {
+    success: boolean;
+    message: string;
+}
+
+// Nudge types
+export interface NudgeDocument {
+    deviceId: string;
+    sentAt: FirebaseFirestore.Timestamp;
+    status: "success" | "failed";
+    title: string;
+    body: string;
+    error?: string;
+}
+
+// Food analysis types
+export interface FoodAnalysisRequest {
+    deviceId: string;
+    image?: string; // Base64 encoded image
+}
+
+export interface NutritionData {
+    foodName: string;
+    calories: number;
+    protein: number;
+    carbohydrates: number;
+    fat: number;
+    fiber: number;
+    estimatedServingSize: string;
+}
+
+export interface FoodAnalysisResponse {
+    success: boolean;
+    nutrition?: NutritionData;
+    error?: string;
+}
+
+// API Error response
+export interface ApiErrorResponse {
+    success: false;
+    error: string;
+    code?: string;
+}
+</file>
+
+<file path="functions/.eslintrc.js">
+module.exports = {
+    root: true,
+    env: {
+        es2022: true,
+        node: true,
+    },
+    extends: [
+        "eslint:recommended",
+        "plugin:import/errors",
+        "plugin:import/warnings",
+        "plugin:import/typescript",
+        "google",
+        "plugin:@typescript-eslint/recommended",
+    ],
+    parser: "@typescript-eslint/parser",
+    parserOptions: {
+        project: ["tsconfig.json"],
+        sourceType: "module",
+    },
+    ignorePatterns: [
+        "/lib/**/*",
+        "/node_modules/**/*",
+    ],
+    plugins: [
+        "@typescript-eslint",
+        "import",
+    ],
+    rules: {
+        "quotes": ["error", "double"],
+        "import/no-unresolved": 0,
+        "indent": ["error", 2],
+        "max-len": ["error", { "code": 120 }],
+        "object-curly-spacing": ["error", "always"],
+        "require-jsdoc": 0,
+        "valid-jsdoc": 0,
+    },
+};
+</file>
+
+<file path="functions/package.json">
+{
+  "name": "weigh-backend-functions",
+  "version": "1.0.0",
+  "description": "Firebase Cloud Functions for weight-tracking mobile app",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "shell": "npm run build && firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log",
+    "lint": "eslint --ext .ts src/",
+    "lint:fix": "eslint --ext .ts src/ --fix"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.1.2",
+    "openai": "^4.77.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.4",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "eslint": "^8.57.1",
+    "eslint-config-google": "^0.14.0",
+    "eslint-plugin-import": "^2.31.0",
+    "typescript": "^5.7.2"
+  },
+  "private": true
+}
+</file>
+
+<file path="functions/tsconfig.json">
+{
+    "compilerOptions": {
+        "module": "commonjs",
+        "noImplicitReturns": true,
+        "noUnusedLocals": true,
+        "outDir": "lib",
+        "sourceMap": true,
+        "strict": true,
+        "target": "ES2022",
+        "skipLibCheck": true,
+        "esModuleInterop": true,
+        "resolveJsonModule": true,
+        "moduleResolution": "node",
+        "declaration": true,
+        "declarationMap": true
+    },
+    "compileOnSave": true,
+    "include": [
+        "src"
+    ]
+}
+</file>
+
+<file path=".firebaserc">
+{
+  "projects": {
+    "default": "platewise-b8995"
+  }
+}
+</file>
+
+<file path="firebase.json">
+{
+    "functions": {
+        "source": "functions",
+        "runtime": "nodejs20",
+        "predeploy": [
+            "npm --prefix \"$RESOURCE_DIR\" run lint",
+            "npm --prefix \"$RESOURCE_DIR\" run build"
+        ]
+    },
+    "firestore": {
+        "rules": "firestore.rules",
+        "indexes": "firestore.indexes.json"
+    }
+}
+</file>
+
+<file path="firestore.indexes.json">
+{
+    "indexes": [],
+    "fieldOverrides": []
+}
+</file>
+
+<file path="firestore.rules">
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All Firestore access is through Cloud Functions only
+    // No direct client access allowed
+    
+    // Devices collection - backend only
+    match /devices/{deviceId} {
+      allow read, write: if false;
+    }
+    
+    // Nudges collection - backend only
+    match /nudges/{nudgeId} {
+      allow read, write: if false;
+    }
+    
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+</file>
+
+<file path="README.md">
+# Weigh Backend
+
+A minimal Firebase Cloud Functions backend for a mobile weight-tracking app. Built with **TypeScript** and **Node.js 20**.
+
+## Features
+
+- **Device Registration**: Register devices for push notifications using `deviceId` as the identifier
+- **Daily Push Notifications**: Scheduled Cloud Function sends weight logging reminders
+- **AI Food Analysis**: Analyze food images for nutritional information using GPT-4 Vision
+
+## Architecture
+
+```
+┌─────────────────┐     ┌──────────────────────────────────────────┐
+│   Mobile App    │────▶│           Firebase Cloud Functions        │
+└─────────────────┘     │  ┌─────────────┐  ┌───────────────────┐  │
+                        │  │  register-  │  │   analyze-food-   │  │
+                        │  │   device    │  │      image        │  │
+                        │  └──────┬──────┘  └─────────┬─────────┘  │
+                        │         │                   │            │
+                        │         ▼                   ▼            │
+                        │  ┌─────────────┐     ┌───────────┐       │
+                        │  │  Firestore  │     │  OpenAI   │       │
+                        │  │  (devices)  │     │  GPT-4V   │       │
+                        │  └─────────────┘     └───────────┘       │
+                        │         ▲                                │
+                        │         │                                │
+                        │  ┌──────┴──────┐                         │
+                        │  │ dailyNudge  │◀── Cloud Scheduler      │
+                        │  │ (scheduled) │    (9:00 AM UTC)        │
+                        │  └──────┬──────┘                         │
+                        │         │                                │
+                        │         ▼                                │
+                        │  ┌─────────────┐                         │
+                        │  │     FCM     │────▶ Push Notifications │
+                        │  └─────────────┘                         │
+                        └──────────────────────────────────────────┘
+```
+
+## Prerequisites
+
+- [Node.js 20](https://nodejs.org/)
+- [Firebase CLI](https://firebase.google.com/docs/cli)
+- An existing Firebase project with:
+  - Cloud Functions enabled (Blaze plan required)
+  - Firestore database created
+  - Cloud Messaging (FCM) enabled
+- [OpenAI API key](https://platform.openai.com/) with GPT-4 Vision access
+
+## Project Structure
+
+```
+Weigh_Backend/
+├── .github/workflows/
+│   └── deploy.yml          # GitHub Actions CI/CD
+├── functions/
+│   ├── src/
+│   │   ├── index.ts        # Function exports
+│   │   ├── config/         # Configuration constants
+│   │   ├── handlers/       # HTTP and scheduled handlers
+│   │   ├── services/       # Firestore, FCM, Vision services
+│   │   ├── types/          # TypeScript interfaces
+│   │   └── utils/          # Validation and error handling
+│   ├── package.json
+│   └── tsconfig.json
+├── firebase.json           # Firebase configuration
+├── firestore.rules         # Security rules
+└── README.md
+```
+
+## Setup Instructions
+
+### 1. Clone and Install
+
+```bash
+git clone https://github.com/YOUR_USERNAME/Weigh_Backend.git
+cd Weigh_Backend
+cd functions && npm install
+```
+
+### 2. Configure Firebase
+
+Update `.firebaserc` with your Firebase project ID:
+
+```json
+{
+  "projects": {
+    "default": "your-firebase-project-id"
+  }
+}
+```
+
+Login to Firebase CLI:
+
+```bash
+firebase login
+```
+
+### 3. Set Environment Variables
+
+For local development, set the OpenAI API key:
+
+```bash
+firebase functions:secrets:set OPENAI_API_KEY
+```
+
+When prompted, enter your OpenAI API key.
+
+### 4. Local Development
+
+Start the Firebase emulators:
+
+```bash
+firebase emulators:start --only functions,firestore
+```
+
+The emulator will be available at `http://localhost:5001`.
+
+### 5. Deploy to Firebase
+
+Manual deployment:
+
+```bash
+firebase deploy --only functions,firestore:rules
+```
+
+## GitHub Actions Setup (CI/CD)
+
+### Required Secrets
+
+Add these secrets to your GitHub repository (`Settings > Secrets and variables > Actions`):
+
+| Secret | Description |
+|--------|-------------|
+| `FIREBASE_PROJECT_ID` | Your Firebase project ID |
+| `FIREBASE_SERVICE_ACCOUNT` | Service account JSON key (see below) |
+
+### Generate Service Account Key
+
+1. Go to [Firebase Console](https://console.firebase.google.com/) > Project Settings > Service accounts
+2. Click "Generate new private key"
+3. Copy the entire JSON content
+4. Add it as `FIREBASE_SERVICE_ACCOUNT` secret in GitHub
+
+### Trigger Deployment
+
+Push to `main` branch to trigger automatic deployment, or use "Run workflow" in GitHub Actions.
+
+## API Reference
+
+### POST /register-device
+
+Register or update a device for push notifications.
+
+**Request:**
+```json
+{
+  "deviceId": "unique-device-id",
+  "fcmToken": "firebase-cloud-messaging-token",
+  "platform": "ios" | "android"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Device registered successfully"
+}
+```
+
+### POST /analyze-food-image
+
+Analyze a food image and get nutritional estimates.
+
+**Request (JSON):**
+```json
+{
+  "deviceId": "unique-device-id",
+  "image": "base64-encoded-image-data"
+}
+```
+
+**Request (Multipart):**
+```
+Content-Type: multipart/form-data
+
+deviceId: unique-device-id
+image: [file upload]
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "nutrition": {
+    "foodName": "Grilled Chicken Salad",
+    "calories": 350,
+    "protein": 35,
+    "carbohydrates": 15,
+    "fat": 18,
+    "fiber": 5,
+    "estimatedServingSize": "1 bowl (approximately 300g)"
+  }
+}
+```
+
+**Limits:**
+- Max image size: 5MB
+- Supported formats: JPEG, PNG, WebP
+- Timeout: 60 seconds
+
+## Firestore Schema
+
+### Collection: `devices`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `deviceId` | string | Document ID |
+| `fcmToken` | string | FCM token |
+| `platform` | string | "ios" or "android" |
+| `createdAt` | timestamp | First registration |
+| `lastSeenAt` | timestamp | Updated on each registration |
+
+### Collection: `nudges`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `deviceId` | string | Target device |
+| `sentAt` | timestamp | When sent |
+| `status` | string | "success" or "failed" |
+| `title` | string | Notification title |
+| `body` | string | Notification body |
+| `error` | string | Error message (if failed) |
+
+## Error Handling
+
+All endpoints return consistent error responses:
+
+```json
+{
+  "success": false,
+  "error": "Error message",
+  "code": "ERROR_CODE"
+}
+```
+
+| HTTP Code | Error Code | Description |
+|-----------|------------|-------------|
+| 400 | `INVALID_REQUEST` | Missing or invalid input |
+| 405 | - | Method not allowed |
+| 413 | `IMAGE_TOO_LARGE` | Image exceeds 5MB |
+| 415 | `UNSUPPORTED_FORMAT` | Invalid image format |
+| 422 | `ANALYSIS_FAILED` | Vision API couldn't analyze |
+| 500 | `INTERNAL_ERROR` | Server error |
+
+## Development
+
+### Build
+
+```bash
+cd functions
+npm run build
+```
+
+### Lint
+
+```bash
+cd functions
+npm run lint
+```
+
+### Watch Mode
+
+```bash
+cd functions
+npm run build:watch
+```
+
+## Security Notes
+
+- No Firebase Auth is used; `deviceId` is the only identifier
+- All Firestore access is denied to clients (backend-only)
+- OpenAI API key is stored as a Firebase secret
+- Images are not stored server-side
+
+## License
+
+MIT
+</file>
+
+<file path="functions/src/handlers/analyzeFoodImage.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import Busboy from "busboy";
+import { analyzeFood } from "../services/vision";
+import { deductCredit } from "../services/user";
+import { foodAnalysisSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+import { LIMITS, VISION_CONFIG } from "../config/constants";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+
+// Extend Express Request to include rawBody (added by Firebase Functions)
+interface FirebaseRequest extends Request {
+  rawBody?: Buffer;
+}
+
+interface ParsedRequest {
+  imageBase64: string;
+  mimeType: string;
+}
+
+function parseMultipartRequest(req: FirebaseRequest): Promise<ParsedRequest> {
+  return new Promise((resolve, reject) => {
+    // eslint-disable-next-line new-cap
+    const bb = Busboy({
+      headers: req.headers,
+      limits: {
+        fileSize: LIMITS.MAX_IMAGE_SIZE_BYTES,
+        files: 1,
+      },
+    });
+
+    let imageBuffer: Buffer | null = null;
+    let mimeType = "";
+    let fileLimitExceeded = false;
+
+    bb.on("file", (
+      _fieldname: string,
+      file: NodeJS.ReadableStream,
+      info: { filename: string; encoding: string; mimeType: string },
+    ) => {
+      mimeType = info.mimeType;
+      const chunks: Buffer[] = [];
+
+      file.on("data", (chunk: Buffer) => {
+        chunks.push(chunk);
+      });
+
+      file.on("limit", () => {
+        fileLimitExceeded = true;
+      });
+
+      file.on("end", () => {
+        imageBuffer = Buffer.concat(chunks);
+      });
+    });
+
+    bb.on("finish", () => {
+      if (fileLimitExceeded) {
+        reject(errors.imageTooLarge(LIMITS.MAX_IMAGE_SIZE_BYTES));
+        return;
+      }
+
+      if (!imageBuffer) {
+        reject(errors.invalidRequest("No image provided"));
+        return;
+      }
+
+      resolve({
+        imageBase64: imageBuffer.toString("base64"),
+        mimeType,
+      });
+    });
+
+    bb.on("error", (error: Error) => {
+      reject(error);
+    });
+
+    // Handle the case where body is already parsed (e.g., by Firebase Functions)
+    if (req.rawBody) {
+      bb.end(req.rawBody);
+    } else {
+      req.pipe(bb);
+    }
+  });
+}
+
+function parseJsonRequest(req: Request): ParsedRequest {
+  const validation = validateInput(foodAnalysisSchema, req.body);
+  if (!validation.success) {
+    throw errors.invalidRequest(validation.error);
+  }
+
+  const { image } = validation.data;
+
+  if (!image) {
+    throw errors.invalidRequest("image is required");
+  }
+
+  return {
+    imageBase64: image,
+    mimeType: "image/jpeg", // Assume JPEG for base64
+  };
+}
+
+// Create a mutable copy of supported formats for includes check
+const supportedFormats: string[] = [...VISION_CONFIG.SUPPORTED_FORMATS];
+
+/**
+ * Food Image Analysis Handler
+ * Requires authentication and deducts 1 credit per analysis
+ */
+export async function analyzeFoodImage(
+  req: FirebaseRequest & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    // If verifyAuth responded with error, stop here
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Safe: verifyAuth ensures uid exists
+    logger.info(`Analyzing food image for user: ${uid}`);
+
+    // Deduct credit before analysis (throws if insufficient)
+    const remainingCredits = await deductCredit(uid);
+    logger.info(`Credit deducted, remaining: ${remainingCredits}`);
+
+    let parsed: ParsedRequest;
+
+    // Parse based on content type
+    const contentType = req.headers["content-type"] || "";
+    if (contentType.includes("multipart/form-data")) {
+      parsed = await parseMultipartRequest(req);
+    } else if (contentType.includes("application/json")) {
+      parsed = parseJsonRequest(req);
+    } else {
+      throw errors.invalidRequest(
+        "Content-Type must be multipart/form-data or application/json",
+      );
+    }
+
+    // Validate image format
+    if (!supportedFormats.includes(parsed.mimeType)) {
+      throw errors.unsupportedFormat([...VISION_CONFIG.SUPPORTED_FORMATS]);
+    }
+
+    // Analyze the food image
+    const nutrition = await analyzeFood(parsed.imageBase64);
+
+    res.status(200).json({
+      success: true,
+      nutrition,
+      creditsRemaining: remainingCredits,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/services/vision.ts">
+import OpenAI from "openai";
+import { logger } from "firebase-functions/v2";
+import { defineString } from "firebase-functions/params";
+import { NutritionData } from "../types";
+import { VISION_CONFIG } from "../config/constants";
+import { errors } from "../utils/errors";
+
+// Define the API key as a Firebase parameter (set via firebase functions:config or secrets)
+const openaiApiKey = defineString("OPENAI_API_KEY");
+
+/* eslint-disable max-len */
+const NUTRITION_PROMPT = `You are a nutrition analysis expert. Analyze the food in this image and provide nutritional information.
+
+IMPORTANT: Respond ONLY with valid JSON in this exact format, no additional text:
+{
+  "foodName": "name of the food/dish",
+  "calories": number (estimated calories),
+  "protein": number (grams),
+  "carbohydrates": number (grams),
+  "fat": number (grams),
+  "fiber": number (grams),
+  "estimatedServingSize": "description of serving size"
+}
+
+If you cannot identify the food or the image doesn't contain food, respond with:
+{
+  "error": "description of the issue",
+  "errorType": "NOT_FOOD" | "BLURRY" | "MULTIPLE_ITEMS" | "LOW_CONFIDENCE" | "OTHER"
+}
+
+Be reasonable with estimates based on typical serving sizes visible in the image.`;
+/* eslint-enable max-len */
+
+/**
+ * Maps AI error types to our ApiError factories
+ */
+function handleAiError(errorMessage: string, errorType?: string): never {
+  const lowerMessage = errorMessage.toLowerCase();
+
+  // Check explicit errorType first
+  if (errorType) {
+    switch (errorType) {
+    case "NOT_FOOD":
+      throw errors.notFood(errorMessage);
+    case "BLURRY":
+      throw errors.imageTooBlurry();
+    case "MULTIPLE_ITEMS":
+      throw errors.multipleFoods();
+    case "LOW_CONFIDENCE":
+      throw errors.lowConfidence();
+    default:
+      throw errors.analysisFailed(errorMessage);
+    }
+  }
+
+  // Fallback: detect from message content
+  if (
+    lowerMessage.includes("not food") ||
+    lowerMessage.includes("no food") ||
+    lowerMessage.includes("doesn't contain food") ||
+    lowerMessage.includes("does not contain food") ||
+    lowerMessage.includes("not a food")
+  ) {
+    throw errors.notFood(errorMessage);
+  }
+
+  if (
+    lowerMessage.includes("blurry") ||
+    lowerMessage.includes("unclear") ||
+    lowerMessage.includes("out of focus")
+  ) {
+    throw errors.imageTooBlurry();
+  }
+
+  if (
+    lowerMessage.includes("multiple") ||
+    lowerMessage.includes("several items")
+  ) {
+    throw errors.multipleFoods();
+  }
+
+  if (
+    lowerMessage.includes("cannot identify") ||
+    lowerMessage.includes("unable to identify") ||
+    lowerMessage.includes("not sure") ||
+    lowerMessage.includes("unclear what")
+  ) {
+    throw errors.lowConfidence();
+  }
+
+  // Generic fallback
+  throw errors.analysisFailed(errorMessage);
+}
+
+export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
+  const apiKey = openaiApiKey.value();
+
+  if (!apiKey) {
+    throw errors.aiConfigError();
+  }
+
+  const openai = new OpenAI({ apiKey });
+
+  logger.info("Starting food image analysis");
+
+  let response;
+  try {
+    response = await openai.chat.completions.create({
+      model: VISION_CONFIG.MODEL,
+      max_tokens: VISION_CONFIG.MAX_TOKENS,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: NUTRITION_PROMPT },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${imageBase64}`,
+                detail: "low",
+              },
+            },
+          ],
+        },
+      ],
+    });
+  } catch (err) {
+    logger.error("OpenAI API error", { error: err });
+    throw errors.aiServiceError();
+  }
+
+  const content = response.choices[0]?.message?.content;
+
+  if (!content) {
+    throw errors.aiServiceError();
+  }
+
+  logger.info("Received response from vision model");
+
+  // Parse the JSON response
+  let parsed: NutritionData | { error: string; errorType?: string };
+  try {
+    // Clean up the response - remove markdown code blocks if present
+    let cleanContent = content.trim();
+    if (cleanContent.startsWith("```json")) {
+      cleanContent = cleanContent.slice(7);
+    }
+    if (cleanContent.startsWith("```")) {
+      cleanContent = cleanContent.slice(3);
+    }
+    if (cleanContent.endsWith("```")) {
+      cleanContent = cleanContent.slice(0, -3);
+    }
+    parsed = JSON.parse(cleanContent.trim());
+  } catch {
+    logger.error("Failed to parse vision response", { content });
+    throw errors.parseError();
+  }
+
+  // Check for error response from AI
+  if ("error" in parsed) {
+    handleAiError(
+      parsed.error,
+      "errorType" in parsed ? parsed.errorType : undefined,
+    );
+  }
+
+  // Validate the response has all required fields
+  const required = [
+    "foodName",
+    "calories",
+    "protein",
+    "carbohydrates",
+    "fat",
+    "fiber",
+    "estimatedServingSize",
+  ];
+  for (const field of required) {
+    if (!(field in parsed)) {
+      throw errors.parseError();
+    }
+  }
+
+  return parsed as NutritionData;
+}
+</file>
+
+<file path="functions/src/utils/validation.ts">
+import { z } from "zod";
+
+// Device registration validation schema
+export const deviceRegistrationSchema = z.object({
+  deviceId: z
+    .string()
+    .min(1, "deviceId is required")
+    .max(256, "deviceId too long"),
+  fcmToken: z
+    .string()
+    .min(1, "fcmToken is required")
+    .max(4096, "fcmToken too long"),
+  platform: z.enum(["ios", "android"], {
+    errorMap: () => ({ message: "platform must be 'ios' or 'android'" }),
+  }),
+});
+
+// Food analysis validation schema (deviceId now optional, auth provides uid)
+export const foodAnalysisSchema = z.object({
+  image: z
+    .string()
+    .min(1, "image is required")
+    .optional(),
+});
+
+// Backup data validation schema
+export const backupSchema = z.object({
+  weightEntries: z.array(z.unknown()).optional(),
+  foodLogs: z.array(z.unknown()).optional(),
+  streaks: z.record(z.unknown()).optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+
+// Type exports from schemas
+export type DeviceRegistrationInput = z.infer<typeof deviceRegistrationSchema>;
+export type FoodAnalysisInput = z.infer<typeof foodAnalysisSchema>;
+export type BackupInput = z.infer<typeof backupSchema>;
+
+// Validation helper
+export function validateInput<T>(
+  schema: z.ZodSchema<T>,
+  data: unknown,
+): { success: true; data: T } | { success: false; error: string } {
+  const result = schema.safeParse(data);
+  if (result.success) {
+    return { success: true, data: result.data };
+  }
+  const errorMessage = result.error.errors
+    .map((e) => `${e.path.join(".")}: ${e.message}`)
+    .join(", ");
+  return { success: false, error: errorMessage };
+}
+</file>
+
+<file path=".gitignore">
+# Dependencies
+node_modules/
+functions/node_modules/
+functions/lib/
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+pubsub-debug.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Misc
+*.bak
+*.tmp
+</file>
+
+<file path="functions/src/utils/errors.ts">
+import { Response } from "express";
+import { logger } from "firebase-functions/v2";
+
+export class ApiError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string,
+    public code?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function handleError(error: unknown, res: Response): void {
+  if (error instanceof ApiError) {
+    logger.warn(`API Error: ${error.message}`, { code: error.code });
+    res.status(error.statusCode).json({
+      success: false,
+      error: error.message,
+      code: error.code,
+    });
+    return;
+  }
+
+  if (error instanceof Error) {
+    logger.error(`Unexpected error: ${error.message}`, { stack: error.stack });
+    res.status(500).json({
+      success: false,
+      error: "Internal server error",
+    });
+    return;
+  }
+
+  logger.error("Unknown error type", { error });
+  res.status(500).json({
+    success: false,
+    error: "Internal server error",
+  });
+}
+
+// Common API error factories (lowercase to satisfy new-cap rule)
+export const errors = {
+  invalidRequest: (message: string) =>
+    new ApiError(400, message, "INVALID_REQUEST"),
+  deviceNotFound: () =>
+    new ApiError(404, "Device not found", "DEVICE_NOT_FOUND"),
+  imageTooLarge: (maxSize: number) =>
+    new ApiError(
+      413,
+      `Image exceeds maximum size of ${maxSize / 1024 / 1024}MB`,
+      "IMAGE_TOO_LARGE",
+    ),
+  unsupportedFormat: (formats: string[]) =>
+    new ApiError(
+      415,
+      `Unsupported image format. Supported: ${formats.join(", ")}`,
+      "UNSUPPORTED_FORMAT",
+    ),
+  analysisFailed: (reason: string) =>
+    new ApiError(422, `Food analysis failed: ${reason}`, "ANALYSIS_FAILED"),
+  notFood: (description?: string) =>
+    new ApiError(
+      422,
+      description || "The image does not appear to contain food",
+      "NOT_FOOD",
+    ),
+  imageTooBlurry: () =>
+    new ApiError(
+      422,
+      "The image is too blurry or unclear to analyze",
+      "IMAGE_TOO_BLURRY",
+    ),
+  multipleFoods: () =>
+    new ApiError(
+      422,
+      "Multiple food items detected. Please capture one item at a time",
+      "MULTIPLE_FOODS",
+    ),
+  lowConfidence: () =>
+    new ApiError(
+      422,
+      "Could not confidently identify the food. Try a clearer photo",
+      "LOW_CONFIDENCE",
+    ),
+  aiServiceError: () =>
+    new ApiError(
+      503,
+      "AI service temporarily unavailable. Please try again",
+      "AI_SERVICE_ERROR",
+    ),
+  aiConfigError: () =>
+    new ApiError(
+      500,
+      "AI service configuration error",
+      "AI_CONFIG_ERROR",
+    ),
+  parseError: () =>
+    new ApiError(
+      500,
+      "Failed to parse AI response",
+      "PARSE_ERROR",
+    ),
+  rateLimited: () =>
+    new ApiError(429, "Too many requests", "RATE_LIMITED"),
+  internalError: () =>
+    new ApiError(500, "Internal server error", "INTERNAL_ERROR"),
+  // Auth & Credits errors
+  unauthorized: (message?: string) =>
+    new ApiError(401, message || "Unauthorized", "UNAUTHORIZED"),
+  insufficientCredits: () =>
+    new ApiError(402, "Insufficient AI credits", "INSUFFICIENT_CREDITS"),
+  backupNotFound: () =>
+    new ApiError(404, "No backup found for this user", "BACKUP_NOT_FOUND"),
+  storageError: (message?: string) =>
+    new ApiError(500, message || "Storage operation failed", "STORAGE_ERROR"),
+};
+</file>
+
+<file path="functions/src/index.ts">
+import { onRequest } from "firebase-functions/v2/https";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { setGlobalOptions } from "firebase-functions/v2";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { registerDevice } from "./handlers/registerDevice";
+import { sendDailyNudge } from "./handlers/sendDailyNudge";
+import { analyzeFoodImage } from "./handlers/analyzeFoodImage";
+import { createBackup, restoreBackup, getBackupStatus } from "./handlers/backup";
+import { getCreditsHandler, getUserProfile } from "./handlers/credits";
+import { FUNCTION_CONFIG } from "./config/constants";
+
+// Initialize Firebase Admin SDK (only if not already initialized)
+if (getApps().length === 0) {
+  initializeApp();
+}
+
+// Set global options for all functions
+setGlobalOptions({
+  region: FUNCTION_CONFIG.REGION,
+  timeoutSeconds: FUNCTION_CONFIG.TIMEOUT_SECONDS,
+});
+
+/**
+ * Device Registration Endpoint
+ * POST /register-device
+ *
+ * Registers or updates a device for push notifications.
+ * Uses deviceId as the primary identifier.
+ */
+export const registerDeviceFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  registerDevice,
+);
+
+/**
+ * Daily Weight Reminder
+ * Scheduled to run at 9:00 AM UTC every day
+ */
+export const dailyNudge = onSchedule(
+  {
+    schedule: "0 9 * * *",
+    timeZone: "UTC",
+    memory: FUNCTION_CONFIG.MEMORY,
+  },
+  sendDailyNudge,
+);
+
+/**
+ * Food Image Analysis Endpoint
+ * POST /analyze-food-image
+ *
+ * Requires authentication. Deducts 1 credit per analysis.
+ */
+export const analyzeFoodImageFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.ANALYSIS_MEMORY,
+    timeoutSeconds: 60,
+    cors: true,
+    invoker: "public",
+  },
+  analyzeFoodImage,
+);
+
+/**
+ * Create Backup Endpoint
+ * POST /backup
+ *
+ * Requires authentication. Saves user data backup.
+ */
+export const backupFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  createBackup,
+);
+
+/**
+ * Restore Backup Endpoint
+ * POST /restore
+ *
+ * Requires authentication. Returns saved backup data.
+ */
+export const restoreFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  restoreBackup,
+);
+
+/**
+ * Backup Status Endpoint
+ * GET /backup-status
+ *
+ * Requires authentication. Returns backup metadata.
+ */
+export const backupStatusFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  getBackupStatus,
+);
+
+/**
+ * Credits Endpoint
+ * GET /credits
+ *
+ * Requires authentication. Returns credit balance.
+ */
+export const creditsFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  getCreditsHandler,
+);
+
+/**
+ * User Profile Endpoint
+ * GET /user/me
+ *
+ * Requires authentication. Returns user profile with credits.
+ */
+export const userProfileFunction = onRequest(
+  {
+    memory: FUNCTION_CONFIG.MEMORY,
+    cors: true,
+    invoker: "public",
+  },
+  getUserProfile,
+);
+</file>
+
+<file path="int.md">
+# Backend Integration Guide
+
+This document provides all necessary information to connect the frontend mobile app to the Platewise Firebase backend.
+
+## 🔗 API Base URLs
+
+| Service | Live URL |
+|---------|----------|
+| Device Registration | https://registerdevicefunction-kxzhine25a-uc.a.run.app |
+| Food Analysis | https://analyzefoodimagefunction-kxzhine25a-uc.a.run.app |
+| Backup | https://us-central1-platewise-b8995.cloudfunctions.net/backupFunction |
+| Restore | https://us-central1-platewise-b8995.cloudfunctions.net/restoreFunction |
+| Backup Status | https://us-central1-platewise-b8995.cloudfunctions.net/backupStatusFunction |
+| Credits | https://us-central1-platewise-b8995.cloudfunctions.net/creditsFunction |
+| User Profile | https://us-central1-platewise-b8995.cloudfunctions.net/userProfileFunction |
+
+---
+
+## 🔐 Authentication
+
+All authenticated endpoints require a Firebase ID token in the `Authorization` header:
+
+```typescript
+const headers = {
+  'Content-Type': 'application/json',
+  'Authorization': `Bearer ${await auth().currentUser?.getIdToken()}`
+};
+```
+
+### Authentication Flow
+1. **Anonymous Auth**: Users start with anonymous Firebase Auth
+2. **Link Account**: Later link to Google/Email for data persistence
+3. **All data is keyed by `uid`** - survives reinstalls when signed in
+
+---
+
+## 🛠️ TypeScript Interfaces
+
+```typescript
+// Common Response Wrapper
+interface ApiResponse<T> {
+  success: boolean;
+  message?: string;
+  error?: string;
+  code?: string;
+  data?: T;
+}
+
+// Food Analysis Response
+interface NutritionData {
+  foodName: string;
+  calories: number;
+  protein: number;
+  carbohydrates: number;
+  fat: number;
+  fiber: number;
+  estimatedServingSize: string;
+}
+
+interface FoodAnalysisResponse {
+  success: boolean;
+  nutrition: NutritionData;
+  creditsRemaining: number;
+}
+
+// User Profile
+interface UserProfile {
+  uid: string;
+  aiCredits: number;
+  totalGranted: number;
+  totalUsed: number;
+  createdAt: string;
+  lastActiveAt: string;
+}
+
+// Backup Data
+interface BackupPayload {
+  weightEntries?: unknown[];
+  foodLogs?: unknown[];
+  streaks?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+```
+
+---
+
+## 📡 Endpoints
+
+### 1. Analyze Food Image (Authenticated)
+**POST** `https://analyzefoodimagefunction-kxzhine25a-uc.a.run.app`
+
+Analyzes food image using GPT-4 Vision. **Requires auth token. Deducts 1 credit.**
+
+```typescript
+const analyzeFood = async (base64Image: string) => {
+  const response = await fetch(URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${await getIdToken()}`
+    },
+    body: JSON.stringify({ image: base64Image }),
+  });
+  return response.json(); // { success, nutrition, creditsRemaining }
+};
+```
+
+### 2. Get Credits
+**GET** `https://us-central1-platewise-b8995.cloudfunctions.net/creditsFunction`
+
+```typescript
+const getCredits = async () => {
+  const res = await fetch(URL, {
+    headers: { 'Authorization': `Bearer ${await getIdToken()}` }
+  });
+  return res.json(); // { success, credits: number }
+};
+```
+
+### 3. Get User Profile
+**GET** `https://us-central1-platewise-b8995.cloudfunctions.net/userProfileFunction`
+
+```typescript
+const getUserProfile = async () => {
+  const res = await fetch(URL, {
+    headers: { 'Authorization': `Bearer ${await getIdToken()}` }
+  });
+  return res.json(); // { success, user: UserProfile }
+};
+```
+
+### 4. Create Backup
+**POST** `https://us-central1-platewise-b8995.cloudfunctions.net/backupFunction`
+
+```typescript
+const createBackup = async (data: BackupPayload) => {
+  const res = await fetch(URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${await getIdToken()}`
+    },
+    body: JSON.stringify(data),
+  });
+  return res.json(); // { success, message }
+};
+```
+
+### 5. Restore Backup
+**POST** `https://us-central1-platewise-b8995.cloudfunctions.net/restoreFunction`
+
+```typescript
+const restoreBackup = async () => {
+  const res = await fetch(URL, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${await getIdToken()}` }
+  });
+  return res.json(); // { success, data: BackupPayload }
+};
+```
+
+### 6. Get Backup Status
+**GET** `https://us-central1-platewise-b8995.cloudfunctions.net/backupStatusFunction`
+
+```typescript
+const getBackupStatus = async () => {
+  const res = await fetch(URL, {
+    headers: { 'Authorization': `Bearer ${await getIdToken()}` }
+  });
+  return res.json(); // { success, exists: boolean, createdAt?: string, version?: number }
+};
+```
+
+### 7. Register Device (No Auth)
+**POST** `https://registerdevicefunction-kxzhine25a-uc.a.run.app`
+
+```typescript
+const registerDevice = async (data: {
+  deviceId: string;
+  fcmToken: string;
+  platform: 'ios' | 'android';
+}) => {
+  const res = await fetch(URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return res.json();
+};
+```
+
+---
+
+## 🚨 Error Codes
+
+### Auth & Credits Errors
+| Code | HTTP | Description |
+|------|------|-------------|
+| `UNAUTHORIZED` | 401 | Missing or invalid Firebase ID token |
+| `INSUFFICIENT_CREDITS` | 402 | No AI credits remaining |
+| `BACKUP_NOT_FOUND` | 404 | No backup exists for this user |
+
+### Input Validation Errors
+| Code | HTTP | Description |
+|------|------|-------------|
+| `INVALID_REQUEST` | 400 | Missing or malformed fields |
+| `IMAGE_TOO_LARGE` | 413 | Image exceeds 5MB |
+| `UNSUPPORTED_FORMAT` | 415 | Must be JPEG, PNG, or WebP |
+
+### Food Analysis Errors
+| Code | HTTP | Description |
+|------|------|-------------|
+| `NOT_FOOD` | 422 | Image doesn't contain food |
+| `IMAGE_TOO_BLURRY` | 422 | Image is blurry/unclear |
+| `MULTIPLE_FOODS` | 422 | Multiple items detected |
+| `LOW_CONFIDENCE` | 422 | AI can't identify the food |
+
+### Server Errors
+| Code | HTTP | Description |
+|------|------|-------------|
+| `AI_SERVICE_ERROR` | 503 | OpenAI temporarily unavailable |
+| `STORAGE_ERROR` | 500 | Cloud Storage operation failed |
+
+---
+
+## 💰 Credits System
+
+- New users receive **20 free AI credits**
+- **1 credit** is deducted per food analysis
+- `creditsRemaining` is returned in the food analysis response
+- Check balance anytime via `/creditsFunction`
+</file>
+
+</files>

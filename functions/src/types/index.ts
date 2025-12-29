@@ -58,3 +58,12 @@ export interface ApiErrorResponse {
     error: string;
     code?: string;
 }
+
+// Backup payload types
+// Matches backupSchema in utils/validation.ts
+export interface BackupPayload {
+    weightEntries?: unknown[];
+    foodLogs?: unknown[];
+    streaks?: Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+}
