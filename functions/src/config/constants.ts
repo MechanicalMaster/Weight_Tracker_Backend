@@ -3,6 +3,7 @@
 export const COLLECTIONS = {
   DEVICES: "devices",
   NUDGES: "nudges",
+  FOOD_ANALYSES: "food_analyses",
 } as const;
 
 export const LIMITS = {
@@ -17,10 +18,11 @@ export const NUDGE_CONFIG = {
 } as const;
 
 export const VISION_CONFIG = {
-  MODEL: "gpt-4o",
-  MAX_TOKENS: 1024,
+  MODEL: "gpt-5.2",
+  MAX_TOKENS: 2048,
   TIMEOUT_MS: 60000,
   SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
+  PROMPT_VERSION: "vision_v3_canonical_singlepass",
 } as const;
 
 export const FUNCTION_CONFIG = {

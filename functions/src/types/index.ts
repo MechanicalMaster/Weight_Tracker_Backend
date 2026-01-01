@@ -1,5 +1,7 @@
 // Type definitions for the weight-tracking backend
 
+// Re-export vision schemas
+export * from "./visionSchemas";
 // Device registration types
 export interface DeviceRegistrationRequest {
     deviceId: string;
