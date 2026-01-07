@@ -1,8 +1,8 @@
 # Weigh Backend API Integration Guide
 
-> **Version:** 2.0 (2-Pass Vision Inference)  
+> **Version:** 2.1 (Consolidated API)  
 > **Model:** GPT-5.2  
-> **Last Updated:** 2026-01-01
+> **Last Updated:** 2026-01-06
 
 ---
 
@@ -72,23 +72,29 @@ Auth.auth().currentUser?.getIDToken { token, error in
 
 ## Base URL & Region
 
-### Production URLs
-
-| Endpoint | Live URL |
-|----------|----------|
-| Device Registration | `https://registerdevicefunction-kxzhine25a-uc.a.run.app` |
-| Food Analysis | `https://analyzefoodimagefunction-kxzhine25a-uc.a.run.app` |
-| Backup | `https://us-central1-platewise-b8995.cloudfunctions.net/backupFunction` |
-| Restore | `https://us-central1-platewise-b8995.cloudfunctions.net/restoreFunction` |
-| Backup Status | `https://us-central1-platewise-b8995.cloudfunctions.net/backupStatusFunction` |
-| Credits | `https://us-central1-platewise-b8995.cloudfunctions.net/creditsFunction` |
-| User Profile | `https://us-central1-platewise-b8995.cloudfunctions.net/userProfileFunction` |
-
-### Generic Pattern
+### Production Base URL
 
 ```
-https://us-central1-<your-project-id>.cloudfunctions.net/<functionName>
+https://api-<deployment-hash>-uc.a.run.app
 ```
+
+> [!IMPORTANT]
+> All endpoints now use a **single consolidated API**. Replace the placeholder with your actual deployed URL.
+
+### Route Map
+
+| Method | Route | Auth | Description |
+|--------|-------|------|-------------|
+| GET | `/health` | No | Health check |
+| POST | `/register-device` | No | Device registration |
+| POST | `/analyze-food` | Yes | Food image analysis |
+| POST | `/backup` | Yes | Create backup |
+| POST | `/restore` | Yes | Restore backup |
+| GET | `/backup-status` | Yes | Backup metadata |
+| GET | `/credits` | Yes | Credit balance |
+| GET | `/user/me` | Yes | User profile |
+
+> Route paths are stable for v2.x and will not change without a major version bump.
 
 ---
 
@@ -224,9 +230,11 @@ Content-Type: application/json
 #### Code Example
 
 ```typescript
+const API_BASE = 'https://api-<deployment-hash>-uc.a.run.app';
+
 const analyzeFood = async (base64Image: string) => {
   const response = await fetch(
-    'https://analyzefoodimagefunction-kxzhine25a-uc.a.run.app',
+    `${API_BASE}/analyze-food`,
     {
       method: 'POST',
       headers: {
@@ -350,7 +358,7 @@ Authorization: Bearer <token>
 ```typescript
 const getUserProfile = async () => {
   const res = await fetch(
-    'https://us-central1-platewise-b8995.cloudfunctions.net/userProfileFunction',
+    `${API_BASE}/user/me`,
     {
       headers: { 'Authorization': `Bearer ${await getIdToken()}` }
     }
@@ -387,7 +395,7 @@ Authorization: Bearer <token>
 ```typescript
 const getCredits = async () => {
   const res = await fetch(
-    'https://us-central1-platewise-b8995.cloudfunctions.net/creditsFunction',
+    `${API_BASE}/credits`,
     {
       headers: { 'Authorization': `Bearer ${await getIdToken()}` }
     }
@@ -448,7 +456,7 @@ All fields are optional. The payload is stored as-is.
 ```typescript
 const createBackup = async (data: BackupPayload) => {
   const res = await fetch(
-    'https://us-central1-platewise-b8995.cloudfunctions.net/backupFunction',
+    `${API_BASE}/backup`,
     {
       method: 'POST',
       headers: {
@@ -495,7 +503,7 @@ Authorization: Bearer <token>
 ```typescript
 const restoreBackup = async () => {
   const res = await fetch(
-    'https://us-central1-platewise-b8995.cloudfunctions.net/restoreFunction',
+    `${API_BASE}/restore`,
     {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${await getIdToken()}` }
@@ -544,7 +552,7 @@ Authorization: Bearer <token>
 ```typescript
 const getBackupStatus = async () => {
   const res = await fetch(
-    'https://us-central1-platewise-b8995.cloudfunctions.net/backupStatusFunction',
+    `${API_BASE}/backup-status`,
     {
       headers: { 'Authorization': `Bearer ${await getIdToken()}` }
     }
@@ -601,7 +609,7 @@ const registerDevice = async (data: {
   platform: 'ios' | 'android';
 }) => {
   const res = await fetch(
-    'https://registerdevicefunction-kxzhine25a-uc.a.run.app',
+    `${API_BASE}/register-device`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -646,7 +654,7 @@ const registerDevice = async (data: {
 | New user registration | +20 (free) |
 | Food image analysis | -1 |
 
-When credits reach 0, `/analyzeFoodImageFunction` returns:
+When credits reach 0, `/analyze-food` returns:
 
 ```json
 {
@@ -658,8 +666,8 @@ When credits reach 0, `/analyzeFoodImageFunction` returns:
 
 ### Best Practices
 
-1. **Check credits before analysis** — call `/creditsFunction` first
-2. **Cache the profile** — avoid excessive `/userProfileFunction` calls
+1. **Check credits before analysis** — call `/credits` first
+2. **Cache the profile** — avoid excessive `/user/me` calls
 3. **Handle 402 gracefully** — show upgrade prompt in UI
 
 ---
@@ -737,12 +745,14 @@ import { getAuth, signInAnonymously } from "firebase/auth";
 const app = initializeApp({ /* your config */ });
 const auth = getAuth(app);
 
+const API_BASE = 'https://api-<deployment-hash>-uc.a.run.app';
+
 async function analyzeFood(imageBase64: string) {
   const user = await signInAnonymously(auth);
   const token = await user.user.getIdToken();
 
   const response = await fetch(
-    "https://us-central1-<project>.cloudfunctions.net/analyzeFoodImageFunction",
+    `${API_BASE}/analyze-food`,
     {
       method: "POST",
       headers: {
