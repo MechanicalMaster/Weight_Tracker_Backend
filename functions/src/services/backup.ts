@@ -61,9 +61,9 @@ export async function saveBackup(
   const file = bucket.file(storagePath);
 
   // Upload blob FIRST (atomicity guarantee)
+  // NOTE: Do NOT set contentEncoding: "gzip" - this causes Cloud Storage to auto-decompress on download
   await file.save(compressed, {
     contentType: "application/gzip",
-    metadata: { contentEncoding: "gzip" },
   });
 
   logger.info("Backup uploaded to Cloud Storage", {
@@ -111,14 +111,26 @@ export async function loadBackup(uid: string): Promise<BackupPayload> {
   const file = bucket.file(backup.storagePath);
 
   const [contents] = await file.download();
-  const decompressed = await gunzip(contents);
+
+  // Check if data is gzip compressed by looking for magic bytes (0x1f 0x8b)
+  const isGzipped = contents.length >= 2 && contents[0] === 0x1f && contents[1] === 0x8b;
+
+  let jsonString: string;
+  if (isGzipped) {
+    const decompressed = await gunzip(contents);
+    jsonString = decompressed.toString("utf-8");
+  } else {
+    // Handle legacy uncompressed backups or auto-decompressed data
+    jsonString = contents.toString("utf-8");
+    logger.warn("Backup data was not gzip compressed", { uid });
+  }
 
   logger.info("Backup loaded from Cloud Storage", {
     uid,
     version: backup.version,
   });
 
-  return JSON.parse(decompressed.toString("utf-8"));
+  return JSON.parse(jsonString);
 }
 
 /**

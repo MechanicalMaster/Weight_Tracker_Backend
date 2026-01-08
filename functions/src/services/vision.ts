@@ -4,10 +4,14 @@ import { logger } from "firebase-functions/v2";
 import { defineString } from "firebase-functions/params";
 import {
   VisionPassResult,
-  VisionPassResultSchema,
   VisionErrorSchema,
   FoodAnalysisRecord,
   NutritionData,
+  PerceptionResult,
+  PerceptionResultSchema,
+  NutritionResult,
+  NutritionResultSchema,
+  PerceptionItem,
 } from "../types";
 import { VISION_CONFIG, COLLECTIONS } from "../config/constants";
 import { errors } from "../utils/errors";
@@ -17,55 +21,75 @@ import { db, admin } from "./firestore";
 const openaiApiKey = defineString("OPENAI_API_KEY");
 
 // =============================================================================
-// STRICT SYSTEM PROMPT - Multi-item with latent canonicalization
+// 2-STAGE PROMPTS
 // =============================================================================
 
 /* eslint-disable max-len */
-const NUTRITION_PROMPT = `You are a precision food analysis system. Analyze the food image and return structured nutrition data.
 
-RULES:
-1. Detect up to 5 distinct food items in the image
-2. For each item, estimate weight in grams and complete nutrition
-3. Include latent canonical attributes for each item (internal classification)
-4. Provide confidence score and visual cues that informed your estimate
-5. All numeric values must be positive numbers, not strings
+/**
+ * Stage 1: Vision Perception
+ * Only what requires pixels. Nothing else.
+ */
+const PERCEPTION_PROMPT = `You are a food perception system.
 
-RESPONSE FORMAT (JSON only, no markdown):
+Task:
+From the image, identify up to 5 distinct food items and estimate their
+approximate edible weight in grams.
+
+Rules:
+- Focus on visual identification only.
+- Be conservative with weight estimates.
+- Do NOT estimate nutrition.
+- Do NOT explain reasoning.
+- Do NOT infer ingredients or cooking method.
+- Output JSON only.
+
+Response format:
 {
   "items": [
     {
-      "foodName": "string - specific name of food item",
+      "foodName": "string",
       "estimatedWeight_g": number,
+      "confidence": number between 0 and 1
+    }
+  ]
+}
+
+Error format:
+{
+  "error": "description",
+  "errorType": "NOT_FOOD" | "BLURRY" | "LOW_CONFIDENCE" | "MULTIPLE_ITEMS"
+}`;
+
+/**
+ * Stage 2: Nutrition Reasoning (Text-only)
+ * Statistical nutrition estimation from identified items.
+ */
+const NUTRITION_PROMPT = `You are a nutrition estimation system.
+
+Given the following food items and their estimated weights,
+estimate typical home-style nutrition values.
+
+Rules:
+- Use typical preparation assumptions.
+- Be conservative.
+- No explanations.
+- Output JSON only.
+
+Response format:
+{
+  "items": [
+    {
+      "foodName": "string",
       "calories": number,
       "protein": number,
       "carbohydrates": number,
       "fat": number,
-      "fiber": number,
-      "_canonical": {
-        "cuisine": "string - e.g. Indian, Italian, American",
-        "baseIngredients": ["string array - main ingredients"],
-        "cookingMethod": "string - e.g. grilled, fried, raw, steamed",
-        "density": "low" | "medium" | "high",
-        "moisture": "dry" | "moist" | "wet",
-        "processingLevel": "raw" | "minimal" | "processed" | "ultra-processed"
-      },
-      "_debug": {
-        "confidence": number between 0 and 1,
-        "visualCues": ["string array - what you observed"]
-      }
+      "fiber": number
     }
-  ],
-  "totalWeight_g": number,
-  "totalCalories": number
-}
+  ]
+}`;
 
-ERROR FORMAT (if analysis fails):
-{
-  "error": "description of issue",
-  "errorType": "NOT_FOOD" | "BLURRY" | "LOW_CONFIDENCE" | "MULTIPLE_ITEMS"
-}
-
-Be conservative with calorie estimates. Base portion sizes on visible reference objects.`;
 /* eslint-enable max-len */
 
 // =============================================================================
@@ -98,6 +122,25 @@ function cleanJsonResponse(content: string): string {
     clean = clean.slice(0, -3);
   }
   return clean.trim();
+}
+
+/**
+ * Normalize food name between stages
+ * - lowercase
+ * - trim
+ * - basic plural handling
+ */
+function normalizeFoodName(name: string): string {
+  let normalized = name.toLowerCase().trim();
+  // Simple plural normalization
+  if (normalized.endsWith("ies") && normalized.length > 4) {
+    normalized = normalized.slice(0, -3) + "y";
+  } else if (normalized.endsWith("es") && normalized.length > 3) {
+    normalized = normalized.slice(0, -2);
+  } else if (normalized.endsWith("s") && normalized.length > 2) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
 }
 
 // =============================================================================
@@ -136,26 +179,33 @@ function handleAiError(errorMessage: string, errorType?: string): never {
 }
 
 // =============================================================================
-// Single Pass Execution
+// Stage 1: Vision Perception
 // =============================================================================
 
-interface PassOutput {
+interface PerceptionOutput {
   rawText: string;
-  parsed: VisionPassResult;
+  parsed: PerceptionResult;
+  durationMs: number;
 }
 
-async function runSinglePass(
+/**
+ * Stage 1: Identify food items and estimate weights from image.
+ * Uses vision model with tight token limit.
+ */
+async function runVisionPerception(
   openai: OpenAI,
   imageBase64: string,
-): Promise<PassOutput> {
+): Promise<PerceptionOutput> {
+  const startTime = Date.now();
+
   const response = await openai.chat.completions.create({
     model: VISION_CONFIG.MODEL,
-    max_completion_tokens: VISION_CONFIG.MAX_TOKENS,
+    max_completion_tokens: VISION_CONFIG.PERCEPTION_MAX_TOKENS,
     messages: [
       {
         role: "user",
         content: [
-          { type: "text", text: NUTRITION_PROMPT },
+          { type: "text", text: PERCEPTION_PROMPT },
           {
             type: "image_url",
             image_url: {
@@ -168,7 +218,9 @@ async function runSinglePass(
     ],
   });
 
+  const durationMs = Date.now() - startTime;
   const rawText = response.choices[0]?.message?.content;
+
   if (!rawText) {
     throw errors.aiServiceError();
   }
@@ -179,7 +231,7 @@ async function runSinglePass(
   try {
     parsed = JSON.parse(cleanContent);
   } catch {
-    logger.error("Failed to parse vision response", { rawText });
+    logger.error("Failed to parse perception response", { rawText });
     throw errors.parseError();
   }
 
@@ -189,17 +241,178 @@ async function runSinglePass(
     handleAiError(errorResult.data.error, errorResult.data.errorType);
   }
 
-  // Parse as success response
-  const successResult = VisionPassResultSchema.safeParse(parsed);
+  // Parse as perception result
+  const successResult = PerceptionResultSchema.safeParse(parsed);
   if (!successResult.success) {
-    logger.error("Vision response validation failed", {
+    logger.error("Perception response validation failed", {
       errors: successResult.error.issues,
       rawText,
     });
     throw errors.parseError();
   }
 
-  return { rawText, parsed: successResult.data };
+  logger.info("Stage 1 (Perception) complete", {
+    itemCount: successResult.data.items.length,
+    durationMs,
+  });
+
+  return { rawText, parsed: successResult.data, durationMs };
+}
+
+// =============================================================================
+// Stage 2: Nutrition Reasoning (Text-only)
+// =============================================================================
+
+interface NutritionOutput {
+  rawText: string;
+  parsed: NutritionResult;
+  durationMs: number;
+}
+
+/**
+ * Stage 2: Estimate nutrition from identified food items.
+ * Text-only model call - no image context.
+ */
+async function runNutritionText(
+  openai: OpenAI,
+  items: PerceptionItem[],
+): Promise<NutritionOutput> {
+  const startTime = Date.now();
+
+  // Prepare input with normalized food names
+  const input = items.map((item) => ({
+    foodName: item.foodName,
+    estimatedWeight_g: item.estimatedWeight_g,
+  }));
+
+  const response = await openai.chat.completions.create({
+    model: VISION_CONFIG.TEXT_MODEL, // Explicitly mark as text-only
+    max_completion_tokens: VISION_CONFIG.NUTRITION_MAX_TOKENS,
+    messages: [
+      {
+        role: "user",
+        content: `${NUTRITION_PROMPT}\n\nInput:\n${JSON.stringify(input, null, 2)}`,
+      },
+    ],
+  });
+
+  const durationMs = Date.now() - startTime;
+  const rawText = response.choices[0]?.message?.content;
+
+  if (!rawText) {
+    throw errors.aiServiceError();
+  }
+
+  const cleanContent = cleanJsonResponse(rawText);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(cleanContent);
+  } catch {
+    logger.error("Failed to parse nutrition response", { rawText });
+    throw errors.parseError();
+  }
+
+  // Parse as nutrition result
+  const successResult = NutritionResultSchema.safeParse(parsed);
+  if (!successResult.success) {
+    logger.error("Nutrition response validation failed", {
+      errors: successResult.error.issues,
+      rawText,
+    });
+    throw errors.parseError();
+  }
+
+  logger.info("Stage 2 (Nutrition) complete", {
+    itemCount: successResult.data.items.length,
+    durationMs,
+  });
+
+  return { rawText, parsed: successResult.data, durationMs };
+}
+
+// =============================================================================
+// Confidence Gating
+// =============================================================================
+
+/**
+ * Gate Stage 2 execution based on perception confidence.
+ * Throws LOW_CONFIDENCE if any item is below threshold.
+ */
+function validatePerceptionConfidence(items: PerceptionItem[]): void {
+  const minConfidence = Math.min(...items.map((i) => i.confidence));
+
+  if (minConfidence < VISION_CONFIG.MIN_CONFIDENCE) {
+    logger.warn("Perception confidence too low, aborting Stage 2", {
+      minConfidence,
+      threshold: VISION_CONFIG.MIN_CONFIDENCE,
+    });
+    throw errors.lowConfidence();
+  }
+}
+
+// =============================================================================
+// Merge Results to VisionPassResult (backward compatibility)
+// =============================================================================
+
+/**
+ * Merge perception and nutrition outputs into VisionPassResult format.
+ * This maintains backward compatibility with existing persistence and aggregation.
+ */
+function mergeToVisionPassResult(
+  perception: PerceptionResult,
+  nutrition: NutritionResult,
+): VisionPassResult {
+  // Create a map of normalized food names to nutrition data
+  const nutritionMap = new Map<string, NutritionResult["items"][0]>();
+  for (const item of nutrition.items) {
+    nutritionMap.set(normalizeFoodName(item.foodName), item);
+  }
+
+  // Merge perception items with nutrition data
+  const items = perception.items.map((pItem) => {
+    const normalizedName = normalizeFoodName(pItem.foodName);
+    const nItem = nutritionMap.get(normalizedName);
+
+    // Default nutrition if not found (shouldn't happen but be safe)
+    const calories = nItem?.calories ?? 0;
+    const protein = nItem?.protein ?? 0;
+    const carbohydrates = nItem?.carbohydrates ?? 0;
+    const fat = nItem?.fat ?? 0;
+    const fiber = nItem?.fiber ?? 0;
+
+    return {
+      foodName: pItem.foodName,
+      estimatedWeight_g: pItem.estimatedWeight_g,
+      calories,
+      protein,
+      carbohydrates,
+      fat,
+      fiber,
+      // Placeholder canonical data (not used in 2-stage mode)
+      _canonical: {
+        cuisine: "unknown",
+        baseIngredients: [],
+        cookingMethod: "unknown",
+        density: "medium" as const,
+        moisture: "moist" as const,
+        processingLevel: "minimal" as const,
+      },
+      _debug: {
+        confidence: pItem.confidence,
+        visualCues: [],
+      },
+    };
+  });
+
+  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
+  const totalCalories = items.reduce((sum, i) => sum + i.calories, 0);
+
+  return {
+    items,
+    totalWeight_g: totalWeight,
+    totalCalories,
+  };
 }
 
 // =============================================================================
@@ -249,7 +462,7 @@ function aggregateToLegacy(result: VisionPassResult): NutritionData {
 }
 
 // =============================================================================
-// Main Entry Point
+// Main Entry Point: 2-Stage Pipeline
 // =============================================================================
 
 export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
@@ -263,38 +476,77 @@ export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
   const openai = new OpenAI({ apiKey });
   const { hash: imageHash, byteLength: imageByteLength } = computeImageHash(imageBase64);
 
-  logger.info("Starting food image analysis", { imageHash });
+  logger.info("Starting 2-stage food analysis", { imageHash });
 
-  // Run single pass
-  let passOutput: PassOutput;
+  // ==========================================================================
+  // Stage 1: Vision Perception
+  // ==========================================================================
+  let perception: PerceptionOutput;
   try {
-    passOutput = await runSinglePass(openai, imageBase64);
+    perception = await runVisionPerception(openai, imageBase64);
   } catch (err) {
-    logger.error("Analysis failed", { error: err });
+    logger.error("Stage 1 (Perception) failed", { error: err });
     throw err;
   }
 
-  logger.info("Analysis complete", {
-    itemCount: passOutput.parsed.items.length,
-    totalCalories: passOutput.parsed.totalCalories,
+  // ==========================================================================
+  // Confidence Gate
+  // ==========================================================================
+  validatePerceptionConfidence(perception.parsed.items);
+
+  // ==========================================================================
+  // Stage 2: Nutrition Reasoning (Text-only)
+  // ==========================================================================
+  let nutrition: NutritionOutput;
+  try {
+    nutrition = await runNutritionText(openai, perception.parsed.items);
+  } catch (err) {
+    logger.error("Stage 2 (Nutrition) failed", { error: err });
+    throw err;
+  }
+
+  // ==========================================================================
+  // Merge Results
+  // ==========================================================================
+  const finalResult = mergeToVisionPassResult(perception.parsed, nutrition.parsed);
+  const totalDurationMs = Date.now() - startTime;
+
+  logger.info("2-stage analysis complete", {
+    itemCount: finalResult.items.length,
+    totalCalories: finalResult.totalCalories,
+    perceptionMs: perception.durationMs,
+    nutritionMs: nutrition.durationMs,
+    totalMs: totalDurationMs,
   });
 
-  // Persist analysis record
+  // ==========================================================================
+  // Persist Analysis Record
+  // ==========================================================================
   const record: FoodAnalysisRecord = {
     imageHash,
     imageByteLength,
     model: VISION_CONFIG.MODEL,
     promptVersion: VISION_CONFIG.PROMPT_VERSION,
-    pass1RawText: passOutput.rawText,
-    pass1Parsed: passOutput.parsed,
-    status: "SINGLE_PASS",
-    finalResult: passOutput.parsed,
+
+    // Stage 1: Perception
+    perceptionRawText: perception.rawText,
+    perceptionParsed: perception.parsed,
+    perceptionDurationMs: perception.durationMs,
+
+    // Stage 2: Nutrition
+    nutritionRawText: nutrition.rawText,
+    nutritionParsed: nutrition.parsed,
+    nutritionDurationMs: nutrition.durationMs,
+
+    // Final result
+    status: "TWO_STAGE",
+    finalResult,
     createdAt: new Date(),
-    durationMs: Date.now() - startTime,
+    durationMs: totalDurationMs,
   };
 
   await persistAnalysis(record);
 
   // Aggregate to legacy format for backward compatibility
-  return aggregateToLegacy(passOutput.parsed);
+  return aggregateToLegacy(finalResult);
 }

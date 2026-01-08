@@ -19,10 +19,14 @@ export const NUDGE_CONFIG = {
 
 export const VISION_CONFIG = {
   MODEL: "gpt-5.2",
-  MAX_TOKENS: 2048,
+  TEXT_MODEL: "gpt-5.2", // Text-only model for Stage 2 (no vision capability needed)
+  PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
+  NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
+  MAX_TOKENS: 2048, // Legacy: single-pass mode
   TIMEOUT_MS: 60000,
   SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
-  PROMPT_VERSION: "vision_v3_canonical_singlepass",
+  PROMPT_VERSION: "vision_v4_2stage",
+  MIN_CONFIDENCE: 0.6, // Gate Stage 2 if perception confidence is below this
 } as const;
 
 export const FUNCTION_CONFIG = {

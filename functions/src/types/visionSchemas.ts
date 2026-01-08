@@ -29,6 +29,41 @@ export const ItemDebugSchema = z.object({
 export type ItemDebug = z.infer<typeof ItemDebugSchema>;
 
 // =============================================================================
+// 2-Stage Architecture: Perception (Stage 1)
+// =============================================================================
+
+export const PerceptionItemSchema = z.object({
+  foodName: z.string(),
+  estimatedWeight_g: z.number().positive(),
+  confidence: z.number().min(0).max(1),
+});
+export type PerceptionItem = z.infer<typeof PerceptionItemSchema>;
+
+export const PerceptionResultSchema = z.object({
+  items: z.array(PerceptionItemSchema).min(1).max(5),
+});
+export type PerceptionResult = z.infer<typeof PerceptionResultSchema>;
+
+// =============================================================================
+// 2-Stage Architecture: Nutrition (Stage 2)
+// =============================================================================
+
+export const NutritionItemSchema = z.object({
+  foodName: z.string(),
+  calories: z.number().nonnegative(),
+  protein: z.number().nonnegative(),
+  carbohydrates: z.number().nonnegative(),
+  fat: z.number().nonnegative(),
+  fiber: z.number().nonnegative(),
+});
+export type NutritionItem = z.infer<typeof NutritionItemSchema>;
+
+export const NutritionResultSchema = z.object({
+  items: z.array(NutritionItemSchema).min(1).max(5),
+});
+export type NutritionResult = z.infer<typeof NutritionResultSchema>;
+
+// =============================================================================
 // Food Item (per-item nutrition)
 // =============================================================================
 
@@ -80,6 +115,7 @@ export type VisionResponse = z.infer<typeof VisionResponseSchema>;
 
 export const AnalysisStatusSchema = z.enum([
   "SINGLE_PASS",
+  "TWO_STAGE",
   "TWO_PASS_AGREED",
   "TWO_PASS_DIVERGED",
 ]);
@@ -101,11 +137,21 @@ export const FoodAnalysisRecordSchema = z.object({
   model: z.string(),
   promptVersion: z.string(),
 
-  // Pass 1 (always present)
-  pass1RawText: z.string(),
-  pass1Parsed: VisionPassResultSchema,
+  // 2-Stage Architecture: Perception (Stage 1)
+  perceptionRawText: z.string().optional(),
+  perceptionParsed: PerceptionResultSchema.optional(),
+  perceptionDurationMs: z.number().optional(),
 
-  // Pass 2 (optional - only if triggered)
+  // 2-Stage Architecture: Nutrition (Stage 2)
+  nutritionRawText: z.string().optional(),
+  nutritionParsed: NutritionResultSchema.optional(),
+  nutritionDurationMs: z.number().optional(),
+
+  // Legacy: Pass 1 (single pass mode)
+  pass1RawText: z.string().optional(),
+  pass1Parsed: VisionPassResultSchema.optional(),
+
+  // Legacy: Pass 2 (optional - only if triggered)
   pass2RawText: z.string().optional(),
   pass2Parsed: VisionPassResultSchema.optional(),
 
