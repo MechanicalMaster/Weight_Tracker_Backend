@@ -18,8 +18,8 @@ export const NUDGE_CONFIG = {
 } as const;
 
 export const VISION_CONFIG = {
-  MODEL: "gpt-5.2",
-  TEXT_MODEL: "gpt-5.2", // Text-only model for Stage 2 (no vision capability needed)
+  MODEL: "gpt-4o",
+  TEXT_MODEL: "gpt-4o", // Text-only model for Stage 2 (no vision capability needed)
   PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
   NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
   MAX_TOKENS: 2048, // Legacy: single-pass mode
