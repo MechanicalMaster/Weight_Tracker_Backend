@@ -13,12 +13,13 @@
 3. [Common Response Structures](#common-response-structures)
 4. [Endpoints](#endpoints)
    - [Food Image Analysis](#1-food-image-analysis)
-   - [User Profile](#2-user-profile)
-   - [Credits](#3-credits)
-   - [Backup](#4-backup)
-   - [Restore](#5-restore)
-   - [Backup Status](#6-backup-status)
-   - [Device Registration](#7-device-registration)
+   - [Quick Food Scan](#2-quick-food-scan)
+   - [User Profile](#3-user-profile)
+   - [Credits](#4-credits)
+   - [Backup](#5-backup)
+   - [Restore](#6-restore)
+   - [Backup Status](#7-backup-status)
+   - [Device Registration](#8-device-registration)
 5. [Error Codes](#error-codes)
 6. [Rate Limiting & Credits](#rate-limiting--credits)
 7. [Internal Architecture](#internal-architecture-for-advanced-integrators)
@@ -88,6 +89,7 @@ https://api-<deployment-hash>-uc.a.run.app
 | GET | `/health` | No | Health check |
 | POST | `/register-device` | No | Device registration |
 | POST | `/analyze-food` | Yes | Food image analysis |
+| POST | `/quick-scan` | Yes | Quick food identification |
 | POST | `/backup` | Yes | Create backup |
 | POST | `/restore` | Yes | Restore backup |
 | GET | `/backup-status` | Yes | Backup metadata |
@@ -316,7 +318,87 @@ When multiple food items are detected:
 
 ---
 
-### 2. User Profile
+### 2. Quick Food Scan
+
+Lightweight food identification that returns simplified results for quick feedback.
+
+> **Auth Required:** Yes  
+> **Credits:** Deducts 1 credit per scan  
+> **Method:** `POST`
+
+#### Request Options
+
+Same as [Food Image Analysis](#1-food-image-analysis) — supports both multipart and JSON with base64.
+
+#### Response
+
+```json
+{
+  "success": true,
+  "foodName": "Grilled Chicken Sandwich",
+  "confidence": "high",
+  "calories": 450,
+  "message": "That's 22% of a typical daily target",
+  "creditsRemaining": 14
+}
+```
+
+#### Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `foodName` | string | Identified food name (or combined names if multiple items) |
+| `confidence` | enum | `"high"`, `"medium"`, or `"low"` |
+| `calories` | number | Rough calorie estimate based on portion size |
+| `message` | string | Human-readable one-liner about calorie percentage |
+
+#### Confidence Levels
+
+| Level | Confidence Score | Meaning |
+|-------|-----------------|---------|
+| `high` | ≥ 80% | Clear identification |
+| `medium` | 60–79% | Reasonable guess |
+| `low` | < 60% | Uncertain identification |
+
+#### Latency Expectations
+
+| Scenario | Typical Latency |
+|----------|----------------|
+| Single item | ~500–700 ms |
+| Multiple items | ~600–800 ms |
+
+> [!NOTE]
+> Quick scan is faster than full analysis because it only runs a single perception stage (no nutrition reasoning).
+
+#### Code Example
+
+```typescript
+const quickScanFood = async (base64Image: string) => {
+  const response = await fetch(
+    `${API_BASE}/quick-scan`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${await getIdToken()}`
+      },
+      body: JSON.stringify({ image: base64Image }),
+    }
+  );
+  return response.json();
+  // { success, foodName, confidence, calories, message, creditsRemaining }
+};
+```
+
+#### Use Cases
+
+- **Quick calorie check** — Get a rough sense before deciding to eat
+- **Food logging preview** — Show user what will be logged before committing
+- **Gamification** — Quick feedback for streak-based features
+
+---
+
+### 3. User Profile
 
 Returns the authenticated user's profile including credit information.
 
@@ -369,7 +451,7 @@ const getUserProfile = async () => {
 
 ---
 
-### 3. Credits
+### 4. Credits
 
 Returns only the credit balance (lightweight alternative to full profile).
 
@@ -406,7 +488,7 @@ const getCredits = async () => {
 
 ---
 
-### 4. Backup
+### 5. Backup
 
 Saves user data to cloud storage.
 
@@ -472,7 +554,7 @@ const createBackup = async (data: BackupPayload) => {
 
 ---
 
-### 5. Restore
+### 6. Restore
 
 Retrieves the most recent backup.
 
@@ -515,7 +597,7 @@ const restoreBackup = async () => {
 
 ---
 
-### 6. Backup Status
+### 7. Backup Status
 
 Check if a backup exists and get metadata.
 
@@ -563,7 +645,7 @@ const getBackupStatus = async () => {
 
 ---
 
-### 7. Device Registration
+### 8. Device Registration
 
 Registers a device for push notifications.
 

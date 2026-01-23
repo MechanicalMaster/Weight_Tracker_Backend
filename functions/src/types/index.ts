@@ -54,6 +54,14 @@ export interface FoodAnalysisResponse {
     error?: string;
 }
 
+// Quick scan response (lightweight food identification)
+export interface QuickScanResponse {
+    foodName: string;
+    confidence: "high" | "medium" | "low";
+    calories: number;
+    message: string;
+}
+
 // API Error response
 export interface ApiErrorResponse {
     success: false;

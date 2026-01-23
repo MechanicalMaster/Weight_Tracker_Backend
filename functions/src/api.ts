@@ -5,6 +5,7 @@ import { analyzeFoodImage } from "./handlers/analyzeFoodImage";
 import { createBackup, restoreBackup, getBackupStatus } from "./handlers/backup";
 import { getCreditsHandler, getUserProfile } from "./handlers/credits";
 import { registerDevice } from "./handlers/registerDevice";
+import { quickScan } from "./handlers/quickScan";
 
 const app = express();
 
@@ -23,6 +24,7 @@ app.use(latencyLogger);
  * -----------------------
  * POST /register-device  - Device registration (no auth)
  * POST /analyze-food     - Food image analysis (auth required)
+ * POST /quick-scan       - Quick food scan (auth required)
  * POST /backup           - Create backup (auth required)
  * POST /restore          - Restore backup (auth required)
  * GET  /backup-status    - Backup metadata (auth required)
@@ -38,6 +40,7 @@ app.post("/register-device", registerDevice);
 
 // Authenticated routes (auth enforced in handlers via verifyAuth)
 app.post("/analyze-food", analyzeFoodImage);
+app.post("/quick-scan", quickScan);
 app.post("/backup", createBackup);
 app.post("/restore", restoreBackup);
 app.get("/backup-status", getBackupStatus);

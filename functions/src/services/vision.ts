@@ -152,16 +152,16 @@ function handleAiError(errorMessage: string, errorType?: string): never {
 
   if (errorType) {
     switch (errorType) {
-    case "NOT_FOOD":
-      throw errors.notFood(errorMessage);
-    case "BLURRY":
-      throw errors.imageTooBlurry();
-    case "MULTIPLE_ITEMS":
-      throw errors.multipleFoods();
-    case "LOW_CONFIDENCE":
-      throw errors.lowConfidence();
-    default:
-      throw errors.analysisFailed(errorMessage);
+      case "NOT_FOOD":
+        throw errors.notFood(errorMessage);
+      case "BLURRY":
+        throw errors.imageTooBlurry();
+      case "MULTIPLE_ITEMS":
+        throw errors.multipleFoods();
+      case "LOW_CONFIDENCE":
+        throw errors.lowConfidence();
+      default:
+        throw errors.analysisFailed(errorMessage);
     }
   }
 
@@ -549,4 +549,86 @@ export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
 
   // Aggregate to legacy format for backward compatibility
   return aggregateToLegacy(finalResult);
+}
+
+// =============================================================================
+// Quick Scan: Single-Stage Lightweight Analysis
+// =============================================================================
+
+const DAILY_CALORIE_TARGET = 2000;
+const AVG_KCAL_PER_GRAM = 1.5; // Conservative average for mixed foods
+
+/**
+ * Map numeric confidence to categorical level
+ */
+function mapConfidenceLevel(confidence: number): "high" | "medium" | "low" {
+  if (confidence >= 0.8) return "high";
+  if (confidence >= 0.6) return "medium";
+  return "low";
+}
+
+/**
+ * Generate one-liner message about calorie percentage
+ */
+function generateCalorieMessage(calories: number): string {
+  const percentage = Math.round((calories / DAILY_CALORIE_TARGET) * 100);
+  return `That's ${percentage}% of a typical daily target`;
+}
+
+/**
+ * Quick food scan - lightweight single-stage analysis
+ * Returns simplified results: food name, confidence, estimated calories, one-liner
+ *
+ * Uses only Stage 1 (perception) for speed.
+ * Does NOT persist to Firestore.
+ */
+export async function quickAnalyzeFood(imageBase64: string): Promise<{
+  foodName: string;
+  confidence: "high" | "medium" | "low";
+  calories: number;
+  message: string;
+}> {
+  const startTime = Date.now();
+  const apiKey = openaiApiKey.value();
+
+  if (!apiKey) {
+    throw errors.aiConfigError();
+  }
+
+  const openai = new OpenAI({ apiKey });
+  const { hash: imageHash } = computeImageHash(imageBase64);
+
+  logger.info("Starting quick food scan", { imageHash });
+
+  // Run Stage 1 only (perception)
+  const perception = await runVisionPerception(openai, imageBase64);
+
+  // Aggregate items if multiple detected
+  const items = perception.parsed.items;
+  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
+  const avgConfidence = items.reduce((sum, i) => sum + i.confidence, 0) / items.length;
+
+  // Generate food name
+  const foodName = items.length === 1
+    ? items[0].foodName
+    : items.map((i) => i.foodName).join(" + ");
+
+  // Rough calorie estimate based on weight
+  const calories = Math.round(totalWeight * AVG_KCAL_PER_GRAM);
+
+  const durationMs = Date.now() - startTime;
+
+  logger.info("Quick scan complete", {
+    foodName,
+    calories,
+    confidence: mapConfidenceLevel(avgConfidence),
+    durationMs,
+  });
+
+  return {
+    foodName,
+    confidence: mapConfidenceLevel(avgConfidence),
+    calories,
+    message: generateCalorieMessage(calories),
+  };
 }

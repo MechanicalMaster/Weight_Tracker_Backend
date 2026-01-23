@@ -37,7 +37,6 @@ export const api = onRequest(
   {
     memory: FUNCTION_CONFIG.ANALYSIS_MEMORY, // 512MiB for vision workload
     timeoutSeconds: 60,
-    minInstances: 1, // Eliminates cold starts (~$0.50/day)
     invoker: "public",
   },
   app,
