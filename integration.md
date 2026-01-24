@@ -90,6 +90,7 @@ https://api-<deployment-hash>-uc.a.run.app
 | POST | `/register-device` | No | Device registration |
 | POST | `/analyze-food` | Yes | Food image analysis |
 | POST | `/quick-scan` | Yes | Quick food identification |
+| POST | `/events` | Yes | Event tracking |
 | POST | `/backup` | Yes | Create backup |
 | POST | `/restore` | Yes | Restore backup |
 | GET | `/backup-status` | Yes | Backup metadata |
@@ -177,6 +178,53 @@ interface BackupStatus {
   exists: boolean;
   lastModified?: string;  // ISO 8601
   sizeBytes?: number;
+}
+
+// Event Tracking
+type EventName = 
+  | 'WEIGHT_LOGGED'
+  | 'FOOD_ANALYZED'
+  | 'DEVICE_REGISTERED'
+  | 'NOTIFICATION_DELIVERED'
+  | 'NOTIFICATION_RECEIVED'
+  | 'NOTIFICATION_OPENED'
+  | 'INTENT_CAPTURED'
+  | 'INTENT_CLOSED';
+
+interface EventRequest {
+  eventId: string;        // UUID v4 (client-generated)
+  eventName: EventName;
+  timestamp: string;      // ISO 8601
+  timezone: string;       // IANA timezone
+  sessionId: string;      // UUID v4 (app-generated on launch)
+  platform: 'ios' | 'android';
+  metadata: Record<string, unknown>;
+}
+
+interface EventResponse {
+  success: boolean;
+  status: 'created' | 'duplicate';
+  eventId: string;
+}
+
+// Weight Logged Event Metadata
+interface WeightLoggedMetadata {
+  weight_value: number;
+  unit: 'kg' | 'lbs';
+  source: 'manual' | 'auto';
+}
+
+// Intent Event Metadata
+interface IntentCapturedMetadata {
+  intent_type: string;
+  expected_duration: number; // minutes
+}
+
+interface IntentClosedMetadata {
+  intent_type: string;
+  outcome: 'completed' | 'abandoned' | 'expired';
+  actual_duration: number;   // minutes
+  expected_duration: number; // minutes
 }
 ```
 
@@ -701,6 +749,205 @@ const registerDevice = async (data: {
   return res.json(); // { success, message }
 };
 ```
+
+---
+
+### 9. Event Tracking
+
+Tracks user behavioral events with idempotent writes and automatic streak computation.
+
+> **Auth Required:** Yes  
+> **Method:** `POST`
+
+```http
+POST /events
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+#### Request Body
+
+```json
+{
+  "eventId": "550e8400-e29b-41d4-a716-446655440000",
+  "eventName": "WEIGHT_LOGGED",
+  "timestamp": "2026-01-24T14:30:00.000Z",
+  "timezone": "Asia/Kolkata",
+  "sessionId": "660e8400-e29b-41d4-a716-446655440001",
+  "platform": "ios",
+  "metadata": {
+    "weight_value": 72.5,
+    "unit": "kg",
+    "source": "manual"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `eventId` | UUID v4 | **Client-generated** unique ID for idempotency |
+| `eventName` | enum | Event type (see below) |
+| `timestamp` | ISO 8601 | When the user triggered the action |
+| `timezone` | IANA string | User's timezone (e.g., `Asia/Kolkata`) |
+| `sessionId` | UUID v4 | Session ID (generated on app launch) |
+| `platform` | enum | `"ios"` or `"android"` |
+| `metadata` | object | Event-specific data (varies by eventName) |
+
+#### Event Types
+
+| Event Name | Description | Metadata Fields |
+|------------|-------------|-----------------|
+| `WEIGHT_LOGGED` | User logged weight | `weight_value`, `unit`, `source` |
+| `FOOD_ANALYZED` | Food image analyzed | `success`, `food_detected`, `credits_remaining`, `latency_ms` |
+| `DEVICE_REGISTERED` | Device registered | `timezone`, `platform`, `app_version?` |
+| `NOTIFICATION_DELIVERED` | Push notification sent (server) | `notification_id`, `notification_type`, `delivery_status` |
+| `NOTIFICATION_RECEIVED` | Notification received on device | `notification_id`, `received_at` |
+| `NOTIFICATION_OPENED` | User opened notification | `notification_id`, `opened_at` |
+| `INTENT_CAPTURED` | User created an intent | `intent_type`, `expected_duration` |
+| `INTENT_CLOSED` | Intent was closed | `intent_type`, `outcome`, `actual_duration`, `expected_duration` |
+
+#### Metadata Schemas
+
+**WEIGHT_LOGGED:**
+```json
+{
+  "weight_value": 72.5,
+  "unit": "kg",
+  "source": "manual"
+}
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `weight_value` | number | positive |
+| `unit` | enum | `"kg"` or `"lbs"` (default: `"kg"`) |
+| `source` | enum | `"manual"` or `"auto"` (default: `"manual"`) |
+
+**INTENT_CAPTURED:**
+```json
+{
+  "intent_type": "workout",
+  "expected_duration": 30
+}
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `intent_type` | string | min 1 char |
+| `expected_duration` | number | minutes (int >= 0) |
+
+**INTENT_CLOSED:**
+```json
+{
+  "intent_type": "workout",
+  "outcome": "completed",
+  "actual_duration": 28,
+  "expected_duration": 30
+}
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `intent_type` | string | min 1 char |
+| `outcome` | enum | `"completed"`, `"abandoned"`, `"expired"` |
+| `actual_duration` | number | minutes (int >= 0) |
+| `expected_duration` | number | minutes (int >= 0) |
+
+#### Response
+
+```json
+{
+  "success": true,
+  "status": "created",
+  "eventId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | enum | `"created"` (new event) or `"duplicate"` (already exists) |
+
+> [!NOTE]
+> Returns 200 OK for **both** new and duplicate events (idempotent success).
+
+#### Streak Logic
+
+When `WEIGHT_LOGGED` events are received, the backend automatically computes streaks:
+
+| Condition | Action |
+|-----------|--------|
+| First log ever | `streak = 1` |
+| Same day as last log | `streak` unchanged |
+| Consecutive day | `streak++` |
+| Gap > 1 day | `streak = 1` (reset) |
+
+Streak state is stored on the user document and updated transactionally.
+
+#### Code Example
+
+```typescript
+const trackEvent = async (
+  eventName: string,
+  metadata: Record<string, unknown>
+) => {
+  const response = await fetch(
+    `${API_BASE}/events`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${await getIdToken()}`
+      },
+      body: JSON.stringify({
+        eventId: crypto.randomUUID(),
+        eventName,
+        timestamp: new Date().toISOString(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        sessionId: getSessionId(), // App-maintained session
+        platform: Platform.OS, // 'ios' or 'android'
+        metadata,
+      }),
+    }
+  );
+  return response.json();
+};
+
+// Example: Log weight
+await trackEvent('WEIGHT_LOGGED', {
+  weight_value: 72.5,
+  unit: 'kg',
+  source: 'manual',
+});
+
+// Example: Intent captured (in handleAddIntent)
+await trackEvent('INTENT_CAPTURED', {
+  intent_type: intent.type,
+  expected_duration: intent.expected_duration,
+});
+
+// Example: Intent closed (on closure)
+await trackEvent('INTENT_CLOSED', {
+  intent_type: closedIntent.type,
+  outcome: 'completed', // or 'abandoned' or 'expired'
+  actual_duration: closedIntent.actual_duration,
+  expected_duration: closedIntent.expected_duration,
+});
+
+// Example: Notification received (in push handler)
+await trackEvent('NOTIFICATION_RECEIVED', {
+  notification_id: notification.data.notification_id,
+  received_at: new Date().toISOString(),
+});
+```
+
+#### Client Requirements
+
+1. **UUID Generation:** Client must generate `eventId` using UUID v4
+2. **Session Management:**
+   - Generate `sessionId` on App Launch
+   - Persist in memory until app kill or >30min background
+3. **Timezone:** Send `Intl.DateTimeFormat().resolvedOptions().timeZone`
+4. **Offline Handling:** Queue events locally and retry on network restore
 
 ---
 

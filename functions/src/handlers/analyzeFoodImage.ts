@@ -3,6 +3,8 @@ import { logger } from "firebase-functions/v2";
 import Busboy from "busboy";
 import { analyzeFood } from "../services/vision";
 import { deductCredit } from "../services/user";
+import { trackEventAsync } from "../services/events";
+import { EventName } from "../types/behavioral";
 import { foodAnalysisSchema, validateInput } from "../utils/validation";
 import { handleError, errors } from "../utils/errors";
 import { LIMITS, VISION_CONFIG } from "../config/constants";
@@ -161,7 +163,26 @@ export async function analyzeFoodImage(
     }
 
     // Analyze the food image
+    const analysisStart = Date.now();
     const nutrition = await analyzeFood(parsed.imageBase64);
+    const latencyMs = Date.now() - analysisStart;
+
+    // Track FOOD_ANALYZED event (fire-and-forget)
+    trackEventAsync({
+      eventName: EventName.FOOD_ANALYZED,
+      userId: uid,
+      timestamp: new Date().toISOString(),
+      timezone: "UTC", // Server doesn't know user timezone here
+      platform: "ios", // Default, client should send this
+      metadata: {
+        success: true,
+        food_detected: true,
+        credits_remaining: remainingCredits,
+        latency_ms: latencyMs,
+      },
+    }).catch((err) => {
+      logger.warn("Failed to track food analysis event", { error: err });
+    });
 
     res.status(200).json({
       success: true,

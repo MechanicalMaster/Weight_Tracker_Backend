@@ -152,16 +152,16 @@ function handleAiError(errorMessage: string, errorType?: string): never {
 
   if (errorType) {
     switch (errorType) {
-      case "NOT_FOOD":
-        throw errors.notFood(errorMessage);
-      case "BLURRY":
-        throw errors.imageTooBlurry();
-      case "MULTIPLE_ITEMS":
-        throw errors.multipleFoods();
-      case "LOW_CONFIDENCE":
-        throw errors.lowConfidence();
-      default:
-        throw errors.analysisFailed(errorMessage);
+    case "NOT_FOOD":
+      throw errors.notFood(errorMessage);
+    case "BLURRY":
+      throw errors.imageTooBlurry();
+    case "MULTIPLE_ITEMS":
+      throw errors.multipleFoods();
+    case "LOW_CONFIDENCE":
+      throw errors.lowConfidence();
+    default:
+      throw errors.analysisFailed(errorMessage);
     }
   }
 
@@ -609,9 +609,9 @@ export async function quickAnalyzeFood(imageBase64: string): Promise<{
   const avgConfidence = items.reduce((sum, i) => sum + i.confidence, 0) / items.length;
 
   // Generate food name
-  const foodName = items.length === 1
-    ? items[0].foodName
-    : items.map((i) => i.foodName).join(" + ");
+  const foodName = items.length === 1 ?
+    items[0].foodName :
+    items.map((i) => i.foodName).join(" + ");
 
   // Rough calorie estimate based on weight
   const calories = Math.round(totalWeight * AVG_KCAL_PER_GRAM);

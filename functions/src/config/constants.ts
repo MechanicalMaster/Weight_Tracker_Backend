@@ -4,6 +4,9 @@ export const COLLECTIONS = {
   DEVICES: "devices",
   NUDGES: "nudges",
   FOOD_ANALYSES: "food_analyses",
+  EVENTS: "events",
+  USERS: "users",
+  NOTIFICATIONS: "notifications",
 } as const;
 
 export const LIMITS = {
@@ -15,6 +18,39 @@ export const LIMITS = {
 export const NUDGE_CONFIG = {
   DEFAULT_TITLE: "Time to log your weight! ⚖️",
   DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
+} as const;
+
+export const NUDGE_TYPES = {
+  WEIGHT_REMINDER: {
+    title: "Good morning! ⚖️",
+    body: "Time to log your weight",
+    link: "platewise://entry",
+  },
+  BREAKFAST: {
+    title: "Breakfast time! 🍳",
+    body: "Had breakfast? Snap a quick photo",
+    link: "platewise://food/capture",
+  },
+  LUNCH: {
+    title: "Lunch time! 🥗",
+    body: "Capture what you're eating",
+    link: "platewise://food/capture",
+  },
+  SNACKS: {
+    title: "Snack check 🍎",
+    body: "Snacking? Log it to stay on track",
+    link: "platewise://food/capture",
+  },
+  DINNER: {
+    title: "Dinner time! 🍽️",
+    body: "Don't forget to log your meal",
+    link: "platewise://food/capture",
+  },
+  EVENING_CHECKIN: {
+    title: "Daily check-in 📊",
+    body: "How was your day? Check your progress",
+    link: "platewise://dashboard",
+  },
 } as const;
 
 export const VISION_CONFIG = {
