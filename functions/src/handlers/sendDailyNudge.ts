@@ -17,6 +17,7 @@ export type NudgeType = keyof typeof NUDGE_TYPES;
 interface NotificationDocument {
   notification_id: string;
   device_id: string;
+  uid: string;
   notification_type: string;
   title: string;
   body: string;
@@ -69,6 +70,7 @@ export function createNudgeHandler(nudgeType: NudgeType) {
         const notificationDoc: NotificationDocument = {
           notification_id: notificationId,
           device_id: result.deviceId,
+          uid: result.uid,
           notification_type: nudgeType,
           title: config.title,
           body: config.body,
@@ -83,7 +85,7 @@ export function createNudgeHandler(nudgeType: NudgeType) {
         // Track NOTIFICATION_DELIVERED event (fire-and-forget)
         trackEventAsync({
           eventName: EventName.NOTIFICATION_DELIVERED,
-          userId: result.deviceId, // Using deviceId as userId for now
+          userId: result.uid, // Use uid for user-level attribution
           timestamp: new Date().toISOString(),
           timezone: "UTC",
           platform: "ios", // Default, we don't know the platform here
@@ -91,6 +93,7 @@ export function createNudgeHandler(nudgeType: NudgeType) {
             notification_id: notificationId,
             notification_type: nudgeType,
             delivery_status: deliveryStatus,
+            device_id: result.deviceId, // Keep deviceId for debugging
             error_message: result.error,
           },
         }).catch((err) => {

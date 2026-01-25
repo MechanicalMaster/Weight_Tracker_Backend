@@ -87,7 +87,7 @@ https://api-<deployment-hash>-uc.a.run.app
 | Method | Route | Auth | Description |
 |--------|-------|------|-------------|
 | GET | `/health` | No | Health check |
-| POST | `/register-device` | No | Device registration |
+| POST | `/register-device` | Yes | Device registration |
 | POST | `/analyze-food` | Yes | Food image analysis |
 | POST | `/quick-scan` | Yes | Quick food identification |
 | POST | `/events` | Yes | Event tracking |
@@ -695,13 +695,17 @@ const getBackupStatus = async () => {
 
 ### 8. Device Registration
 
-Registers a device for push notifications.
+Registers a device for push notifications and links it to the authenticated user.
 
-> **Auth Required:** No  
+> **Auth Required:** Yes  
 > **Method:** `POST`
 
+> [!IMPORTANT]
+> **Breaking Change (v2.2):** This endpoint now requires authentication. The device is linked to the Firebase user (`uid`) to enable user-level notification tracking and account recovery.
+
 ```http
-POST /registerDeviceFunction
+POST /register-device
+Authorization: Bearer <firebase_id_token>
 Content-Type: application/json
 ```
 
@@ -711,7 +715,8 @@ Content-Type: application/json
 {
   "deviceId": "unique-device-identifier",
   "fcmToken": "firebase-cloud-messaging-token",
-  "platform": "ios"
+  "platform": "ios",
+  "timezone": "Asia/Kolkata"
 }
 ```
 
@@ -720,6 +725,7 @@ Content-Type: application/json
 | `deviceId` | string | 1-256 characters |
 | `fcmToken` | string | 1-4096 characters |
 | `platform` | enum | `"ios"` or `"android"` |
+| `timezone` | string | Optional. IANA timezone (e.g., `"Asia/Kolkata"`) |
 
 #### Response
 
@@ -737,18 +743,30 @@ const registerDevice = async (data: {
   deviceId: string;
   fcmToken: string;
   platform: 'ios' | 'android';
+  timezone?: string;
 }) => {
   const res = await fetch(
     `${API_BASE}/register-device`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${await getIdToken()}` // Required!
+      },
       body: JSON.stringify(data),
     }
   );
   return res.json(); // { success, message }
 };
 ```
+
+#### User Journey
+
+1. **Fresh Install:** App calls `auth().signInAnonymously()` → Gets `uid` → Registers device with token
+2. **Device Ownership:** The device document stores `uid`, linking the device to the user
+3. **Account Link (Gmail):** Same `uid` persists after linking; device remains associated
+4. **Reinstall:** New anonymous `uid` is created; device ownership transfers to new account
+5. **Recovery:** User signs in with Google → Original `uid` restored → Device re-linked
 
 ---
 

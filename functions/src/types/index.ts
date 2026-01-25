@@ -11,6 +11,7 @@ export interface DeviceRegistrationRequest {
 
 export interface DeviceDocument {
     deviceId: string;
+    uid: string;
     fcmToken: string;
     platform: "ios" | "android";
     createdAt: FirebaseFirestore.Timestamp;
@@ -25,6 +26,7 @@ export interface DeviceRegistrationResponse {
 // Nudge types
 export interface NudgeDocument {
     deviceId: string;
+    uid: string;
     sentAt: FirebaseFirestore.Timestamp;
     status: "success" | "failed";
     title: string;

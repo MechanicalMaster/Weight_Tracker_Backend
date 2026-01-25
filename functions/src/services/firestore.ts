@@ -12,6 +12,7 @@ const db = admin.firestore();
 
 // Device operations
 export async function upsertDevice(
+  uid: string,
   deviceId: string,
   fcmToken: string,
   platform: "ios" | "android",
@@ -23,23 +24,26 @@ export async function upsertDevice(
 
   if (deviceDoc.exists) {
     // Update existing device
+    // We update the UID to ensure the device is 'claimed' by the current logged-in user
     await deviceRef.update({
+      uid,
       fcmToken,
       platform,
       lastSeenAt: now,
     });
-    logger.info(`Updated device: ${deviceId}`);
+    logger.info(`Updated device: ${deviceId} for user: ${uid}`);
   } else {
     // Create new device
     const newDevice: DeviceDocument = {
       deviceId,
+      uid,
       fcmToken,
       platform,
       createdAt: now,
       lastSeenAt: now,
     };
     await deviceRef.set(newDevice);
-    logger.info(`Registered new device: ${deviceId}`);
+    logger.info(`Registered new device: ${deviceId} for user: ${uid}`);
   }
 }
 

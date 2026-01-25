@@ -5,6 +5,7 @@ import { DeviceDocument } from "../types";
 
 interface SendResult {
   deviceId: string;
+  uid: string;
   success: boolean;
   error?: string;
 }
@@ -62,6 +63,7 @@ export async function sendBatchNotifications(
       const result = await sendPushNotification(device.fcmToken, title, body, link);
       return {
         deviceId: device.deviceId,
+        uid: device.uid,
         success: result.success,
         error: result.error,
       };

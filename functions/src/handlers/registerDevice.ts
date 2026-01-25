@@ -5,8 +5,12 @@ import { trackEventAsync } from "../services/events";
 import { deviceRegistrationSchema, validateInput } from "../utils/validation";
 import { handleError, errors } from "../utils/errors";
 import { EventName } from "../types/behavioral";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
 
-export async function registerDevice(req: Request, res: Response): Promise<void> {
+export async function registerDevice(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
   try {
     // Only allow POST
     if (req.method !== "POST") {
@@ -17,7 +21,19 @@ export async function registerDevice(req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Validate input
+    // 1. VERIFY AUTH
+    // This connects the request to the Firebase User (Anonymous or Gmail)
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Securely obtained from token
+
+    // 2. Validate input
     const validation = validateInput(deviceRegistrationSchema, req.body);
     if (!validation.success) {
       throw errors.invalidRequest(validation.error);
@@ -25,22 +41,23 @@ export async function registerDevice(req: Request, res: Response): Promise<void>
 
     const { deviceId, fcmToken, platform, timezone } = validation.data;
 
-    logger.info(`Registering device: ${deviceId}`, { platform, timezone });
+    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
 
-    // Upsert device in Firestore
-    await upsertDevice(deviceId, fcmToken, platform);
+    // 3. Upsert with UID
+    await upsertDevice(uid, deviceId, fcmToken, platform);
 
-    // Track DEVICE_REGISTERED event (fire-and-forget)
+    // 4. Track Event (Now properly attributed to the UID)
     if (timezone) {
       trackEventAsync({
         eventName: EventName.DEVICE_REGISTERED,
-        userId: deviceId, // Use deviceId as userId for anonymous devices
+        userId: uid, // Use actual UID now, not deviceId
         timestamp: new Date().toISOString(),
         timezone,
         platform,
         metadata: {
           timezone,
           platform,
+          deviceId, // Keep deviceId in metadata for debugging
         },
       }).catch((err) => {
         logger.warn("Failed to track device registration event", { error: err });
@@ -55,3 +72,4 @@ export async function registerDevice(req: Request, res: Response): Promise<void>
     handleError(error, res);
   }
 }
+
