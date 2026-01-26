@@ -951,12 +951,22 @@ await trackEvent('INTENT_CLOSED', {
   expected_duration: closedIntent.expected_duration,
 });
 
+// Example: Notification opened (in push notification handler)
+// The notification_id is automatically included in the FCM data payload
+await trackEvent('NOTIFICATION_OPENED', {
+  notification_id: notification.data.notification_id, // Provided by backend
+  opened_at: new Date().toISOString(),
+});
+
 // Example: Notification received (in push handler)
 await trackEvent('NOTIFICATION_RECEIVED', {
   notification_id: notification.data.notification_id,
   received_at: new Date().toISOString(),
 });
 ```
+
+> [!NOTE]
+> **Notification ID Tracking:** All push notifications sent by the backend include a `notification_id` field in the FCM data payload. Use this ID when tracking `NOTIFICATION_RECEIVED` and `NOTIFICATION_OPENED` events to correlate user engagement with specific notifications.
 
 #### Client Requirements
 

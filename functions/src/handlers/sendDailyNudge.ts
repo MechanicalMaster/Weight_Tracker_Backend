@@ -1,5 +1,4 @@
 import { logger } from "firebase-functions/v2";
-import { randomUUID } from "crypto";
 import { getActiveDevices } from "../services/firestore";
 import { sendBatchNotifications } from "../services/fcm";
 import { trackEventAsync } from "../services/events";
@@ -63,12 +62,11 @@ export function createNudgeHandler(nudgeType: NudgeType) {
 
       // Log each notification result and track events
       const logPromises = results.map(async (result) => {
-        const notificationId = randomUUID();
         const deliveryStatus = result.success ? "success" : "failed";
 
         // Log to 'notifications' collection (replaces 'nudges')
         const notificationDoc: NotificationDocument = {
-          notification_id: notificationId,
+          notification_id: result.notificationId,
           device_id: result.deviceId,
           uid: result.uid,
           notification_type: nudgeType,
@@ -76,7 +74,7 @@ export function createNudgeHandler(nudgeType: NudgeType) {
           body: config.body,
           link: config.link,
           delivery_status: deliveryStatus,
-          error_message: result.error,
+          ...(result.error && { error_message: result.error }),
           sent_at: Timestamp.now(),
         };
 
@@ -90,15 +88,15 @@ export function createNudgeHandler(nudgeType: NudgeType) {
           timezone: "UTC",
           platform: "ios", // Default, we don't know the platform here
           metadata: {
-            notification_id: notificationId,
+            notification_id: result.notificationId,
             notification_type: nudgeType,
             delivery_status: deliveryStatus,
             device_id: result.deviceId, // Keep deviceId for debugging
-            error_message: result.error,
+            ...(result.error && { error_message: result.error }),
           },
         }).catch((err) => {
           logger.warn("Failed to track notification event", {
-            notificationId,
+            notificationId: result.notificationId,
             error: err,
           });
         });

@@ -6,6 +6,7 @@ import { DeviceDocument } from "../types";
 interface SendResult {
   deviceId: string;
   uid: string;
+  notificationId: string;
   success: boolean;
   error?: string;
 }
@@ -14,6 +15,7 @@ export async function sendPushNotification(
   fcmToken: string,
   title: string,
   body: string,
+  notificationId: string,
   link?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -23,7 +25,10 @@ export async function sendPushNotification(
         title,
         body,
       },
-      data: link ? { link } : undefined,
+      data: {
+        notification_id: notificationId,
+        ...(link && { link }),
+      },
       android: {
         priority: "high",
         notification: {
@@ -60,10 +65,18 @@ export async function sendBatchNotifications(
     const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
 
     const batchPromises = batch.map(async (device) => {
-      const result = await sendPushNotification(device.fcmToken, title, body, link);
+      const notificationId = crypto.randomUUID();
+      const result = await sendPushNotification(
+        device.fcmToken,
+        title,
+        body,
+        notificationId,
+        link,
+      );
       return {
         deviceId: device.deviceId,
         uid: device.uid,
+        notificationId,
         success: result.success,
         error: result.error,
       };
