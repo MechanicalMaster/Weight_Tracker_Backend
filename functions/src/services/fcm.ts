@@ -1,9 +1,26 @@
 import { admin } from "./firestore";
 import { logger } from "firebase-functions/v2";
 import { LIMITS } from "../config/constants";
-import { DeviceDocument } from "../types";
 
-interface SendResult {
+/**
+ * Prepared notification payload - fully rendered, ready for delivery.
+ * FCM service is a "dumb" transport layer - it just sends what it receives.
+ */
+export interface PreparedNotification {
+  fcmToken: string;
+  title: string;
+  body: string;
+  notificationId: string;
+  link?: string;
+  // Metadata for logging (not sent to FCM)
+  deviceId: string;
+  uid: string;
+}
+
+/**
+ * Result of sending a notification.
+ */
+export interface SendResult {
   deviceId: string;
   uid: string;
   notificationId: string;
@@ -11,6 +28,9 @@ interface SendResult {
   error?: string;
 }
 
+/**
+ * Send a single push notification via FCM.
+ */
 export async function sendPushNotification(
   fcmToken: string,
   title: string,
@@ -52,31 +72,34 @@ export async function sendPushNotification(
   }
 }
 
+/**
+ * Send batch notifications with prepared payloads.
+ * This is a pure transport layer - payloads are already rendered with personalization.
+ *
+ * @param payloads Array of fully prepared notification payloads
+ * @returns Array of send results
+ */
 export async function sendBatchNotifications(
-  devices: DeviceDocument[],
-  title: string,
-  body: string,
-  link?: string,
+  payloads: PreparedNotification[],
 ): Promise<SendResult[]> {
   const results: SendResult[] = [];
 
   // Process in batches to respect FCM limits
-  for (let i = 0; i < devices.length; i += LIMITS.FCM_BATCH_SIZE) {
-    const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
+  for (let i = 0; i < payloads.length; i += LIMITS.FCM_BATCH_SIZE) {
+    const batch = payloads.slice(i, i + LIMITS.FCM_BATCH_SIZE);
 
-    const batchPromises = batch.map(async (device) => {
-      const notificationId = crypto.randomUUID();
+    const batchPromises = batch.map(async (payload) => {
       const result = await sendPushNotification(
-        device.fcmToken,
-        title,
-        body,
-        notificationId,
-        link,
+        payload.fcmToken,
+        payload.title,
+        payload.body,
+        payload.notificationId,
+        payload.link,
       );
       return {
-        deviceId: device.deviceId,
-        uid: device.uid,
-        notificationId,
+        deviceId: payload.deviceId,
+        uid: payload.uid,
+        notificationId: payload.notificationId,
         success: result.success,
         error: result.error,
       };

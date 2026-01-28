@@ -716,7 +716,8 @@ Content-Type: application/json
   "deviceId": "unique-device-identifier",
   "fcmToken": "firebase-cloud-messaging-token",
   "platform": "ios",
-  "timezone": "Asia/Kolkata"
+  "timezone": "Asia/Kolkata",
+  "displayName": "Ronak"
 }
 ```
 
@@ -726,6 +727,10 @@ Content-Type: application/json
 | `fcmToken` | string | 1-4096 characters |
 | `platform` | enum | `"ios"` or `"android"` |
 | `timezone` | string | Optional. IANA timezone (e.g., `"Asia/Kolkata"`) |
+| `displayName` | string | Optional. Max 100 characters. Used for personalized notifications |
+
+> [!NOTE]
+> `displayName` and `timezone` are stored on the **user profile** (not the device) to enable personalized notifications like *"Good morning, Ronak!"*
 
 #### Response
 
@@ -744,6 +749,7 @@ const registerDevice = async (data: {
   fcmToken: string;
   platform: 'ios' | 'android';
   timezone?: string;
+  displayName?: string;
 }) => {
   const res = await fetch(
     `${API_BASE}/register-device`,

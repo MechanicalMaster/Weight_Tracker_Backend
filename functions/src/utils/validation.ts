@@ -14,6 +14,7 @@ export const deviceRegistrationSchema = z.object({
     errorMap: () => ({ message: "platform must be 'ios' or 'android'" }),
   }),
   timezone: z.string().min(1).optional(),
+  displayName: z.string().max(100).optional(),
 });
 
 // Food analysis validation schema (deviceId now optional, auth provides uid)

@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { logger } from "firebase-functions/v2";
 import { upsertDevice } from "../services/firestore";
+import { upsertUserProfile } from "../services/user";
 import { trackEventAsync } from "../services/events";
 import { deviceRegistrationSchema, validateInput } from "../utils/validation";
 import { handleError, errors } from "../utils/errors";
@@ -39,14 +40,17 @@ export async function registerDevice(
       throw errors.invalidRequest(validation.error);
     }
 
-    const { deviceId, fcmToken, platform, timezone } = validation.data;
+    const { deviceId, fcmToken, platform, timezone, displayName } = validation.data;
 
     logger.info(`Registering device: ${deviceId} to User: ${uid}`);
 
-    // 3. Upsert with UID
+    // 3. Upsert user profile (displayName, timezone)
+    await upsertUserProfile(uid, { displayName, timezone });
+
+    // 4. Upsert device (FCM only, no profile data)
     await upsertDevice(uid, deviceId, fcmToken, platform);
 
-    // 4. Track Event (Now properly attributed to the UID)
+    // 5. Track Event (Now properly attributed to the UID)
     if (timezone) {
       trackEventAsync({
         eventName: EventName.DEVICE_REGISTERED,

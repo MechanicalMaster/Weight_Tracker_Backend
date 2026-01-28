@@ -58,7 +58,7 @@ const SCHEDULE_CONFIG = {
  */
 export const weightReminder = onSchedule(
   { schedule: "30 7 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("WEIGHT_REMINDER"),
+  createNudgeHandler("WEIGHT_REMINDER_V1"),
 );
 
 /**
@@ -67,7 +67,7 @@ export const weightReminder = onSchedule(
  */
 export const breakfastReminder = onSchedule(
   { schedule: "30 8 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("BREAKFAST"),
+  createNudgeHandler("BREAKFAST_V1"),
 );
 
 /**
@@ -76,7 +76,7 @@ export const breakfastReminder = onSchedule(
  */
 export const lunchReminder = onSchedule(
   { schedule: "0 13 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("LUNCH"),
+  createNudgeHandler("LUNCH_V1"),
 );
 
 /**
@@ -85,7 +85,7 @@ export const lunchReminder = onSchedule(
  */
 export const snacksReminder = onSchedule(
   { schedule: "0 17 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("SNACKS"),
+  createNudgeHandler("SNACKS_V1"),
 );
 
 /**
@@ -94,7 +94,7 @@ export const snacksReminder = onSchedule(
  */
 export const dinnerReminder = onSchedule(
   { schedule: "30 20 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("DINNER"),
+  createNudgeHandler("DINNER_V1"),
 );
 
 /**
@@ -103,6 +103,6 @@ export const dinnerReminder = onSchedule(
  */
 export const eveningCheckin = onSchedule(
   { schedule: "30 21 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("EVENING_CHECKIN"),
+  createNudgeHandler("EVENING_CHECKIN_V1"),
 );
 

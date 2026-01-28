@@ -79,9 +79,11 @@ functions/
   tsconfig.json
 .firebaserc
 .gitignore
+ai_strategy.md
 firebase.json
 firestore.indexes.json
 firestore.rules
+implementation_plan.md
 integration.md
 README.md
 specs.md
@@ -90,6 +92,142 @@ storage.rules
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="ai_strategy.md">
+# AI Observability & Evaluation Strategy
+
+## 1. Observability: "What is happening right now?"
+
+Observability goes beyond simple logging. It answers questions like *"Why did that request cost $0.05?"* or *"Why is the model hallucinating hot dogs as carrots?"*.
+
+### A. The "Black Box" Recorder
+We are currently logging inputs (Image Hash) and outputs (Parsed JSON). We need to enrich this.
+
+**Action Items:**
+1.  **Capture Token Usage**: Extract `response.usage` (prompt_tokens, completion_tokens) from OpenAI responses.
+    *   *Why:* To calculate exact COGS (Cost of Goods Sold) per image analysis.
+2.  **Trace ID Propagation**: Ensure a single `traceId` follows the request from the Client -> API -> Stage 1 -> Stage 2 -> Firestore.
+3.  **Model Configuration Snapshot**: Store the exact params used (temperature, max_tokens, prompt_version) alongside the result. You are already doing this with `promptVersion`—excellent.
+
+### B. The Feedback Loop (The "Golden Signal")
+The most valuable signal is **User Correction**.
+If the AI predicts "150g Chicken Breast" and the user changes it to "200g Steak", that is a high-quality training example.
+
+**Implementation Approach:**
+1.  **Link Analysis to Entry**: When the user saves a meal, pass the `FoodAnalysisRecord.id` that generated the data.
+2.  **The "Act vs. Predict" Diff**: Trigger a background function on meal save:
+    *   **Predicted**: { food: "Chicken", calories: 200 } (from `FoodAnalysisRecord`)
+    *   **Actual**: { food: "Steak", calories: 450 } (from `MealLog`)
+    *   **Metric**: Calculate `Error %` or `Semantic Distance`.
+3.  **Flagging**: If `Error % > 50%`, flag the image for manual review (to be added to your Golden Dataset).
+
+---
+
+## 2. Evaluations (Evals): "Is it getting better?"
+
+Never deploy a prompt change without running Evals. It protects you from regression (e.g., you fix "Pizza detection" but break "Salad detection").
+
+### A. The "Golden Dataset"
+You need a "Truth Set".
+
+**Structure:**
+*   Folder: `evals/dataset/`
+*   Content:
+    *   `pizza_01.jpg` -> `pizza_01.json` (Expected: "Pizza", ~300kcal)
+    *   `salad_bowl.jpg` -> `salad_bowl.json` (Expected: "Mixed Greens", ~50kcal)
+*   **Size**: Start with 20 diverse images. Aim for 50.
+
+### B. Automated Eval Pipeline (CI/CD for AI)
+Create a script (e.g., `npm run eval`) that:
+1.  Iterates through your Golden Dataset.
+2.  Runs your *current* `vision.ts` logic against each image.
+3.  **Scores the result** against the `.json` truth file.
+
+**Scoring Metrics:**
+1.  **Hit Rate (Classification)**: Did it identify the "Pizza"? (Yes/No)
+    *   *Implementation*: `string similarity` check or `LLM-as-a-Judge` ("Does 'Margherita Pie' mean 'Pizza'?").
+2.  **MAE (Mean Absolute Error) for Calories**: `Abs(Predicted - Actual)`.
+    *   *Goal*: Minimize this number across the dataset.
+
+### C. LLM-as-a-Judge
+Instead of writing complex Regex to compare "Steak" vs "Beef Steak", use a cheap LLM (gpt-4o-mini) to grade the response.
+
+**Prompt for Judge:**
+> "Ground truth is 'Grilled Chicken Salad'. Model predicted 'Chicken Caesar Salad'. On a scale of 0-1, how accurate is this? 1 = Correct, 0 = Wrong."
+
+---
+
+## 3. Implementation Roadmap
+
+### Phase 1: Passive Observation (Low Effort)
+- [ ] Update `vision.ts` to log token usage and costs.
+- [ ] Add `parentAnalysisId` to your `FoodLog` schema to link saved meals back to AI predictions.
+
+### Phase 2: dataset Accumulation
+- [ ] Create a script to query Firestore for "High Correction" events (where user changed >50% of values).
+- [ ] Download these images + user's "Actual" data to form your **Golden Dataset**.
+
+### Phase 3: Automated Evals
+- [ ] Write the `evals/run.ts` script.
+- [ ] Run this script before every prompt edit.
+</file>
+
+<file path="implementation_plan.md">
+# Plan: Personalized Push Notifications
+
+## Goal
+Include the user's name in push notifications (e.g., "Good morning, Ronak! ⚖️" instead of "Good morning! ⚖️").
+
+## Current State Analysis
+1.  **Missing Data**: The `UserDocument` schema in `functions/src/services/user.ts` does **not** currently have a `displayName` field. Even if the frontend captures it, the backend isn't typing it or using it.
+2.  **Generic Sending**: `sendBatchNotifications` in `functions/src/services/fcm.ts` accepts a single static `title` and `body` string for all devices.
+3.  **Data Flow**: `sendDailyNudge.ts` fetches active devices but does *not* fetch user profiles.
+
+## Detailed Implementation Plan
+
+### 1. Database & Schema Updates
+*   **Update Interface**: Modify `UserDocument` in `functions/src/services/user.ts` to include `displayName?: string`.
+*   **Data Ingestion**: Ensure the `registerDevice` or user onboarding flow actually writes this field to Firestore.
+    *   *Note*: If this is currently handled by the client writing directly to Firestore, we just need to update the backend types. If handled via API, we need to update the request schema.
+
+### 2. Logic Refactor: `sendDailyNudge.ts`
+The nudge handler needs to become "user-aware".
+
+*   **Step A: Fetch Users**: After getting `activeDevices`, extract all unique `uid`s.
+*   **Step B: Batch Read**: Perform a batch read from the `users` collection to get profile data for these UIDs.
+    *   *Optimization*: Use `db.getAll(...userRefs)` or chunked queries to avoid hitting limits.
+*   **Step C: Map creation**: Create a lookup map: `Map<string, UserDocument>`.
+
+### 3. Service Refactor: `fcm.ts`
+The `sendBatchNotifications` function is too rigid.
+
+*   **Change Signature**: Instead of `(devices, title, body)`, it should accept a prepared list of notification objects:
+    ```typescript
+    interface NotificationPayload {
+      device: DeviceDocument;
+      title: string;
+      body: string;
+    }
+    // New signature
+    function sendBatchNotifications(payloads: NotificationPayload[])
+    ```
+*   **Logic**: Iterate through the `payloads` array. For each item, use its specific title and body.
+
+### 4. Putting it Together (Pseudo-Flow)
+1.  `sendDailyNudge` starts.
+2.  Fetches 1000 devices.
+3.  Fetches 800 users (some have multiple devices).
+4.  Loops through devices:
+    *   Finds User for Device A.
+    *   Name = `user.displayName` || "Friend".
+    *   Generates message: `Hello ${Name}!`
+    *   Adds to `payloads` array.
+5.  Calls `sendBatchNotifications(payloads)`.
+
+## Verification Strategy
+1.  **Unit Test**: Mock `sendPushNotification` and verify that when a user has a name, the mock is called with the personalized string.
+2.  **Manually**: Use a test device, register with a name, trigger the cron job, and verify the physical notification.
+</file>
 
 <file path=".github/workflows/deploy.yml">
 name: Deploy to Firebase
@@ -838,85 +976,6 @@ export async function trackEventAsync(
 }
 </file>
 
-<file path="functions/src/services/firestore.ts">
-import * as admin from "firebase-admin";
-import { logger } from "firebase-functions/v2";
-import { COLLECTIONS, LIMITS } from "../config/constants";
-import { DeviceDocument, NudgeDocument } from "../types";
-
-// Initialize Firebase Admin if not already initialized
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
-
-const db = admin.firestore();
-
-// Device operations
-export async function upsertDevice(
-  uid: string,
-  deviceId: string,
-  fcmToken: string,
-  platform: "ios" | "android",
-): Promise<void> {
-  const deviceRef = db.collection(COLLECTIONS.DEVICES).doc(deviceId);
-  const now = admin.firestore.Timestamp.now();
-
-  const deviceDoc = await deviceRef.get();
-
-  if (deviceDoc.exists) {
-    // Update existing device
-    // We update the UID to ensure the device is 'claimed' by the current logged-in user
-    await deviceRef.update({
-      uid,
-      fcmToken,
-      platform,
-      lastSeenAt: now,
-    });
-    logger.info(`Updated device: ${deviceId} for user: ${uid}`);
-  } else {
-    // Create new device
-    const newDevice: DeviceDocument = {
-      deviceId,
-      uid,
-      fcmToken,
-      platform,
-      createdAt: now,
-      lastSeenAt: now,
-    };
-    await deviceRef.set(newDevice);
-    logger.info(`Registered new device: ${deviceId} for user: ${uid}`);
-  }
-}
-
-export async function getActiveDevices(): Promise<DeviceDocument[]> {
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - LIMITS.DEVICE_ACTIVE_DAYS);
-  const cutoffTimestamp = admin.firestore.Timestamp.fromDate(cutoffDate);
-
-  const snapshot = await db
-    .collection(COLLECTIONS.DEVICES)
-    .where("lastSeenAt", ">=", cutoffTimestamp)
-    .get();
-
-  return snapshot.docs.map((doc) => doc.data() as DeviceDocument);
-}
-
-// Nudge operations
-export async function logNudge(nudge: Omit<NudgeDocument, "sentAt">): Promise<void> {
-  const nudgeData: NudgeDocument = {
-    ...nudge,
-    sentAt: admin.firestore.Timestamp.now(),
-  };
-
-  await db.collection(COLLECTIONS.NUDGES).add(nudgeData);
-  logger.info(`Logged nudge for device: ${nudge.deviceId}`, {
-    status: nudge.status,
-  });
-}
-
-export { db, admin };
-</file>
-
 <file path="functions/src/services/user.ts">
 import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
 import { logger } from "firebase-functions/v2";
@@ -1603,190 +1662,6 @@ npm run build:watch
 MIT
 </file>
 
-<file path="specs.md">
-### 2. The Missing Link: Connecting Auth to Push Notifications
-
-Currently, your `register-device` endpoint is **public** and **unaware** of the user. We need to lock the `deviceId` to the `uid`.
-
-Here is the plan to unify them:
-
-1.  **Secure the Endpoint:** Make `/register-device` require a Firebase Token.
-2.  **Store the Link:** Save the `uid` inside the `devices` collection.
-
-#### Step 1: Update `functions/src/services/firestore.ts`
-
-We need to update the `upsertDevice` function to accept and store the `uid`.
-
-```typescript
-// functions/src/services/firestore.ts
-
-import * as admin from "firebase-admin";
-import { logger } from "firebase-functions/v2";
-import { COLLECTIONS, LIMITS } from "../config/constants";
-import { DeviceDocument, NudgeDocument } from "../types";
-
-// ... existing init code ...
-
-const db = admin.firestore();
-
-// Update interface (Optional: add to types/index.ts as well)
-export interface DeviceDocument {
-  deviceId: string;
-  uid: string; // <--- NEW FIELD
-  fcmToken: string;
-  platform: "ios" | "android";
-  createdAt: FirebaseFirestore.Timestamp;
-  lastSeenAt: FirebaseFirestore.Timestamp;
-}
-
-// Updated upsert function
-export async function upsertDevice(
-  uid: string, // <--- NEW PARAM
-  deviceId: string,
-  fcmToken: string,
-  platform: "ios" | "android",
-): Promise<void> {
-  const deviceRef = db.collection(COLLECTIONS.DEVICES).doc(deviceId);
-  const now = admin.firestore.Timestamp.now();
-
-  const deviceDoc = await deviceRef.get();
-
-  if (deviceDoc.exists) {
-    // Update existing device
-    // We update the UID to ensure the device is 'claimed' by the current logged-in user
-    await deviceRef.update({
-      uid, 
-      fcmToken,
-      platform,
-      lastSeenAt: now,
-    });
-    logger.info(`Updated device: ${deviceId} for user: ${uid}`);
-  } else {
-    // Create new device
-    const newDevice: DeviceDocument = {
-      deviceId,
-      uid,
-      fcmToken,
-      platform,
-      createdAt: now,
-      lastSeenAt: now,
-    };
-    await deviceRef.set(newDevice);
-    logger.info(`Registered new device: ${deviceId} for user: ${uid}`);
-  }
-}
-
-// ... rest of the file ...
-```
-
-#### Step 2: Update `functions/src/handlers/registerDevice.ts`
-
-Now we secure the handler so it extracts the `uid` from the token.
-
-```typescript
-// functions/src/handlers/registerDevice.ts
-
-import { Request, Response } from "express";
-import { logger } from "firebase-functions/v2";
-import { upsertDevice } from "../services/firestore";
-import { trackEventAsync } from "../services/events";
-import { deviceRegistrationSchema, validateInput } from "../utils/validation";
-import { handleError, errors } from "../utils/errors";
-import { EventName } from "../types/behavioral";
-import { AuthenticatedRequest, verifyAuth } from "../middleware/auth"; // Import Auth
-
-export async function registerDevice(
-  req: Request & AuthenticatedRequest, // Add AuthenticatedRequest type
-  res: Response
-): Promise<void> {
-  try {
-    if (req.method !== "POST") {
-      res.status(405).json({ success: false, error: "Method not allowed" });
-      return;
-    }
-
-    // 1. VERIFY AUTH
-    // This connects the request to the Firebase User (Anonymous or Gmail)
-    await new Promise<void>((resolve, reject) => {
-      verifyAuth(req, res, (err?: unknown) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    if (res.headersSent) return;
-
-    const uid = req.uid!; // Securely obtained from token
-
-    // 2. Validate input
-    const validation = validateInput(deviceRegistrationSchema, req.body);
-    if (!validation.success) {
-      throw errors.invalidRequest(validation.error);
-    }
-
-    const { deviceId, fcmToken, platform, timezone } = validation.data;
-
-    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
-
-    // 3. Upsert with UID
-    await upsertDevice(uid, deviceId, fcmToken, platform);
-
-    // 4. Track Event (Now properly attributed to the UID)
-    if (timezone) {
-      trackEventAsync({
-        eventName: EventName.DEVICE_REGISTERED,
-        userId: uid, // Use actual UID now, not deviceId
-        timestamp: new Date().toISOString(),
-        timezone,
-        platform,
-        metadata: {
-          timezone,
-          platform,
-          deviceId // Keep deviceId in metadata for reference
-        },
-      }).catch((err) => {
-        logger.warn("Failed to track device registration event", { error: err });
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Device registered successfully",
-    });
-  } catch (error) {
-    handleError(error, res);
-  }
-}
-```
-
-### 3. How the User Journey flows now
-
-1.  **App Launch (Fresh Install):**
-    *   Client SDK: `auth().signInAnonymously()` -> Returns `User A`.
-    *   Client: Calls `POST /register-device` with Token A.
-    *   **Backend:** Locks Device ID `D1` to User `A`.
-
-2.  **Daily Nudge:**
-    *   Scheduler runs. It grabs `D1` from the database.
-    *   Sends Push Notification.
-    *   It works because the device token is fresh.
-
-3.  **User Links Gmail (Optional):**
-    *   Client SDK: `user.linkWithCredential(googleCred)`.
-    *   User is still `User A`, but now has an email attached.
-    *   Client: Calls `POST /register-device` again (on next launch or immediately).
-    *   **Backend:** Updates `D1` -> `User A`. (No change in ID, just refreshed token).
-
-4.  **Reinstall (Android - The Danger Zone):**
-    *   User deletes app. `User A` is wiped from phone.
-    *   User reinstalls. `auth().signInAnonymously()` -> Returns **`User B`** (New ID).
-    *   Client: Calls `POST /register-device`.
-    *   **Backend:** Updates `D1` -> **`User B`**.
-    *   *Result:* The device is now owned by the new empty account. The old history is "orphaned" in `User A`.
-    *   *Recovery:* User clicks "Sign in with Google". Client SDK detects `User A` exists. Logs in as `User A`.
-    *   Client: Calls `POST /register-device`.
-    *   **Backend:** Updates `D1` -> **`User A`**. History restored.
-</file>
-
 <file path="storage.rules">
 rules_version = '2';
 service firebase.storage {
@@ -1982,288 +1857,83 @@ export async function quickScan(
 }
 </file>
 
-<file path="functions/src/handlers/registerDevice.ts">
-import { Request, Response } from "express";
+<file path="functions/src/services/firestore.ts">
+import * as admin from "firebase-admin";
 import { logger } from "firebase-functions/v2";
-import { upsertDevice } from "../services/firestore";
-import { trackEventAsync } from "../services/events";
-import { deviceRegistrationSchema, validateInput } from "../utils/validation";
-import { handleError, errors } from "../utils/errors";
-import { EventName } from "../types/behavioral";
-import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+import { COLLECTIONS, LIMITS } from "../config/constants";
+import { DeviceDocument, NudgeDocument } from "../types";
 
-export async function registerDevice(
-  req: Request & AuthenticatedRequest,
-  res: Response
-): Promise<void> {
-  try {
-    // Only allow POST
-    if (req.method !== "POST") {
-      res.status(405).json({
-        success: false,
-        error: "Method not allowed",
-      });
-      return;
-    }
-
-    // 1. VERIFY AUTH
-    // This connects the request to the Firebase User (Anonymous or Gmail)
-    await new Promise<void>((resolve, reject) => {
-      verifyAuth(req, res, (err?: unknown) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    if (res.headersSent) return;
-
-    const uid = req.uid!; // Securely obtained from token
-
-    // 2. Validate input
-    const validation = validateInput(deviceRegistrationSchema, req.body);
-    if (!validation.success) {
-      throw errors.invalidRequest(validation.error);
-    }
-
-    const { deviceId, fcmToken, platform, timezone } = validation.data;
-
-    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
-
-    // 3. Upsert with UID
-    await upsertDevice(uid, deviceId, fcmToken, platform);
-
-    // 4. Track Event (Now properly attributed to the UID)
-    if (timezone) {
-      trackEventAsync({
-        eventName: EventName.DEVICE_REGISTERED,
-        userId: uid, // Use actual UID now, not deviceId
-        timestamp: new Date().toISOString(),
-        timezone,
-        platform,
-        metadata: {
-          timezone,
-          platform,
-          deviceId, // Keep deviceId in metadata for debugging
-        },
-      }).catch((err) => {
-        logger.warn("Failed to track device registration event", { error: err });
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Device registered successfully",
-    });
-  } catch (error) {
-    handleError(error, res);
-  }
-}
-</file>
-
-<file path="functions/src/handlers/sendDailyNudge.ts">
-import { logger } from "firebase-functions/v2";
-import { randomUUID } from "crypto";
-import { getActiveDevices } from "../services/firestore";
-import { sendBatchNotifications } from "../services/fcm";
-import { trackEventAsync } from "../services/events";
-import { NUDGE_TYPES, COLLECTIONS } from "../config/constants";
-import { EventName } from "../types/behavioral";
-import { getFirestore, Timestamp } from "firebase-admin/firestore";
-
-const db = getFirestore();
-
-export type NudgeType = keyof typeof NUDGE_TYPES;
-
-/**
- * Notification document structure (new collection)
- */
-interface NotificationDocument {
-  notification_id: string;
-  device_id: string;
-  uid: string;
-  notification_type: string;
-  title: string;
-  body: string;
-  link: string;
-  delivery_status: "success" | "failed";
-  error_message?: string;
-  sent_at: FirebaseFirestore.Timestamp;
+// Initialize Firebase Admin if not already initialized
+if (!admin.apps.length) {
+  admin.initializeApp();
 }
 
-/**
- * Log notification to 'notifications' collection
- */
-async function logNotification(notification: NotificationDocument): Promise<void> {
-  await db.collection(COLLECTIONS.NOTIFICATIONS).add(notification);
-}
+const db = admin.firestore();
 
-/**
- * Factory function that creates a nudge handler for a specific type.
- * Each nudge type has its own title, body, and deep link.
- */
-export function createNudgeHandler(nudgeType: NudgeType) {
-  return async function sendNudge(): Promise<void> {
-    const config = NUDGE_TYPES[nudgeType];
-    logger.info(`Starting ${nudgeType} nudge job`, { link: config.link });
-
-    try {
-      // Get all active devices
-      const devices = await getActiveDevices();
-      logger.info(`Found ${devices.length} active devices`);
-
-      if (devices.length === 0) {
-        logger.info("No active devices to notify");
-        return;
-      }
-
-      // Send notifications with deep link
-      const results = await sendBatchNotifications(
-        devices,
-        config.title,
-        config.body,
-        config.link,
-      );
-
-      // Log each notification result and track events
-      const logPromises = results.map(async (result) => {
-        const notificationId = randomUUID();
-        const deliveryStatus = result.success ? "success" : "failed";
-
-        // Log to 'notifications' collection (replaces 'nudges')
-        const notificationDoc: NotificationDocument = {
-          notification_id: notificationId,
-          device_id: result.deviceId,
-          uid: result.uid,
-          notification_type: nudgeType,
-          title: config.title,
-          body: config.body,
-          link: config.link,
-          delivery_status: deliveryStatus,
-          error_message: result.error,
-          sent_at: Timestamp.now(),
-        };
-
-        await logNotification(notificationDoc);
-
-        // Track NOTIFICATION_DELIVERED event (fire-and-forget)
-        trackEventAsync({
-          eventName: EventName.NOTIFICATION_DELIVERED,
-          userId: result.uid, // Use uid for user-level attribution
-          timestamp: new Date().toISOString(),
-          timezone: "UTC",
-          platform: "ios", // Default, we don't know the platform here
-          metadata: {
-            notification_id: notificationId,
-            notification_type: nudgeType,
-            delivery_status: deliveryStatus,
-            device_id: result.deviceId, // Keep deviceId for debugging
-            error_message: result.error,
-          },
-        }).catch((err) => {
-          logger.warn("Failed to track notification event", {
-            notificationId,
-            error: err,
-          });
-        });
-      });
-
-      await Promise.all(logPromises);
-
-      const successCount = results.filter((r) => r.success).length;
-      logger.info(`${nudgeType} nudge complete: ${successCount}/${results.length} successful`);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      logger.error(`${nudgeType} nudge failed: ${errorMessage}`);
-      throw error;
-    }
-  };
-}
-
-// Legacy export for backward compatibility
-export const sendDailyNudge = createNudgeHandler("WEIGHT_REMINDER");
-</file>
-
-<file path="functions/src/services/fcm.ts">
-import { admin } from "./firestore";
-import { logger } from "firebase-functions/v2";
-import { LIMITS } from "../config/constants";
-import { DeviceDocument } from "../types";
-
-interface SendResult {
-  deviceId: string;
-  uid: string;
-  success: boolean;
-  error?: string;
-}
-
-export async function sendPushNotification(
+// Device operations
+export async function upsertDevice(
+  uid: string,
+  deviceId: string,
   fcmToken: string,
-  title: string,
-  body: string,
-  link?: string,
-): Promise<{ success: boolean; error?: string }> {
-  try {
-    await admin.messaging().send({
-      token: fcmToken,
-      notification: {
-        title,
-        body,
-      },
-      data: link ? { link } : undefined,
-      android: {
-        priority: "high",
-        notification: {
-          channelId: "weight_reminders",
-        },
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: "default",
-            badge: 1,
-          },
-        },
-      },
+  platform: "ios" | "android",
+): Promise<void> {
+  const deviceRef = db.collection(COLLECTIONS.DEVICES).doc(deviceId);
+  const now = admin.firestore.Timestamp.now();
+
+  const deviceDoc = await deviceRef.get();
+
+  if (deviceDoc.exists) {
+    // Update existing device
+    // We update the UID to ensure the device is 'claimed' by the current logged-in user
+    await deviceRef.update({
+      uid,
+      fcmToken,
+      platform,
+      lastSeenAt: now,
     });
-    return { success: true };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.warn(`FCM send failed: ${errorMessage}`);
-    return { success: false, error: errorMessage };
+    logger.info(`Updated device: ${deviceId} for user: ${uid}`);
+  } else {
+    // Create new device
+    const newDevice: DeviceDocument = {
+      deviceId,
+      uid,
+      fcmToken,
+      platform,
+      createdAt: now,
+      lastSeenAt: now,
+    };
+    await deviceRef.set(newDevice);
+    logger.info(`Registered new device: ${deviceId} for user: ${uid}`);
   }
 }
 
-export async function sendBatchNotifications(
-  devices: DeviceDocument[],
-  title: string,
-  body: string,
-  link?: string,
-): Promise<SendResult[]> {
-  const results: SendResult[] = [];
+export async function getActiveDevices(): Promise<DeviceDocument[]> {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - LIMITS.DEVICE_ACTIVE_DAYS);
+  const cutoffTimestamp = admin.firestore.Timestamp.fromDate(cutoffDate);
 
-  // Process in batches to respect FCM limits
-  for (let i = 0; i < devices.length; i += LIMITS.FCM_BATCH_SIZE) {
-    const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
+  const snapshot = await db
+    .collection(COLLECTIONS.DEVICES)
+    .where("lastSeenAt", ">=", cutoffTimestamp)
+    .get();
 
-    const batchPromises = batch.map(async (device) => {
-      const result = await sendPushNotification(device.fcmToken, title, body, link);
-      return {
-        deviceId: device.deviceId,
-        uid: device.uid,
-        success: result.success,
-        error: result.error,
-      };
-    });
-
-    const batchResults = await Promise.all(batchPromises);
-    results.push(...batchResults);
-  }
-
-  const successCount = results.filter((r) => r.success).length;
-  const failCount = results.length - successCount;
-  logger.info(`Batch send complete: ${successCount} success, ${failCount} failed`);
-
-  return results;
+  return snapshot.docs.map((doc) => doc.data() as DeviceDocument);
 }
+
+// Nudge operations
+export async function logNudge(nudge: Omit<NudgeDocument, "sentAt">): Promise<void> {
+  const nudgeData: NudgeDocument = {
+    ...nudge,
+    sentAt: admin.firestore.Timestamp.now(),
+  };
+
+  await db.collection(COLLECTIONS.NUDGES).add(nudgeData);
+  logger.info(`Logged nudge for device: ${nudge.deviceId}`, {
+    status: nudge.status,
+  });
+}
+
+export { db, admin };
 </file>
 
 <file path="functions/src/types/visionSchemas.ts">
@@ -2585,6 +2255,190 @@ coverage/
 }
 </file>
 
+<file path="specs.md">
+### 2. The Missing Link: Connecting Auth to Push Notifications
+
+Currently, your `register-device` endpoint is **public** and **unaware** of the user. We need to lock the `deviceId` to the `uid`.
+
+Here is the plan to unify them:
+
+1.  **Secure the Endpoint:** Make `/register-device` require a Firebase Token.
+2.  **Store the Link:** Save the `uid` inside the `devices` collection.
+
+#### Step 1: Update `functions/src/services/firestore.ts`
+
+We need to update the `upsertDevice` function to accept and store the `uid`.
+
+```typescript
+// functions/src/services/firestore.ts
+
+import * as admin from "firebase-admin";
+import { logger } from "firebase-functions/v2";
+import { COLLECTIONS, LIMITS } from "../config/constants";
+import { DeviceDocument, NudgeDocument } from "../types";
+
+// ... existing init code ...
+
+const db = admin.firestore();
+
+// Update interface (Optional: add to types/index.ts as well)
+export interface DeviceDocument {
+  deviceId: string;
+  uid: string; // <--- NEW FIELD
+  fcmToken: string;
+  platform: "ios" | "android";
+  createdAt: FirebaseFirestore.Timestamp;
+  lastSeenAt: FirebaseFirestore.Timestamp;
+}
+
+// Updated upsert function
+export async function upsertDevice(
+  uid: string, // <--- NEW PARAM
+  deviceId: string,
+  fcmToken: string,
+  platform: "ios" | "android",
+): Promise<void> {
+  const deviceRef = db.collection(COLLECTIONS.DEVICES).doc(deviceId);
+  const now = admin.firestore.Timestamp.now();
+
+  const deviceDoc = await deviceRef.get();
+
+  if (deviceDoc.exists) {
+    // Update existing device
+    // We update the UID to ensure the device is 'claimed' by the current logged-in user
+    await deviceRef.update({
+      uid, 
+      fcmToken,
+      platform,
+      lastSeenAt: now,
+    });
+    logger.info(`Updated device: ${deviceId} for user: ${uid}`);
+  } else {
+    // Create new device
+    const newDevice: DeviceDocument = {
+      deviceId,
+      uid,
+      fcmToken,
+      platform,
+      createdAt: now,
+      lastSeenAt: now,
+    };
+    await deviceRef.set(newDevice);
+    logger.info(`Registered new device: ${deviceId} for user: ${uid}`);
+  }
+}
+
+// ... rest of the file ...
+```
+
+#### Step 2: Update `functions/src/handlers/registerDevice.ts`
+
+Now we secure the handler so it extracts the `uid` from the token.
+
+```typescript
+// functions/src/handlers/registerDevice.ts
+
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { upsertDevice } from "../services/firestore";
+import { trackEventAsync } from "../services/events";
+import { deviceRegistrationSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+import { EventName } from "../types/behavioral";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth"; // Import Auth
+
+export async function registerDevice(
+  req: Request & AuthenticatedRequest, // Add AuthenticatedRequest type
+  res: Response
+): Promise<void> {
+  try {
+    if (req.method !== "POST") {
+      res.status(405).json({ success: false, error: "Method not allowed" });
+      return;
+    }
+
+    // 1. VERIFY AUTH
+    // This connects the request to the Firebase User (Anonymous or Gmail)
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Securely obtained from token
+
+    // 2. Validate input
+    const validation = validateInput(deviceRegistrationSchema, req.body);
+    if (!validation.success) {
+      throw errors.invalidRequest(validation.error);
+    }
+
+    const { deviceId, fcmToken, platform, timezone } = validation.data;
+
+    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
+
+    // 3. Upsert with UID
+    await upsertDevice(uid, deviceId, fcmToken, platform);
+
+    // 4. Track Event (Now properly attributed to the UID)
+    if (timezone) {
+      trackEventAsync({
+        eventName: EventName.DEVICE_REGISTERED,
+        userId: uid, // Use actual UID now, not deviceId
+        timestamp: new Date().toISOString(),
+        timezone,
+        platform,
+        metadata: {
+          timezone,
+          platform,
+          deviceId // Keep deviceId in metadata for reference
+        },
+      }).catch((err) => {
+        logger.warn("Failed to track device registration event", { error: err });
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Device registered successfully",
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+```
+
+### 3. How the User Journey flows now
+
+1.  **App Launch (Fresh Install):**
+    *   Client SDK: `auth().signInAnonymously()` -> Returns `User A`.
+    *   Client: Calls `POST /register-device` with Token A.
+    *   **Backend:** Locks Device ID `D1` to User `A`.
+
+2.  **Daily Nudge:**
+    *   Scheduler runs. It grabs `D1` from the database.
+    *   Sends Push Notification.
+    *   It works because the device token is fresh.
+
+3.  **User Links Gmail (Optional):**
+    *   Client SDK: `user.linkWithCredential(googleCred)`.
+    *   User is still `User A`, but now has an email attached.
+    *   Client: Calls `POST /register-device` again (on next launch or immediately).
+    *   **Backend:** Updates `D1` -> `User A`. (No change in ID, just refreshed token).
+
+4.  **Reinstall (Android - The Danger Zone):**
+    *   User deletes app. `User A` is wiped from phone.
+    *   User reinstalls. `auth().signInAnonymously()` -> Returns **`User B`** (New ID).
+    *   Client: Calls `POST /register-device`.
+    *   **Backend:** Updates `D1` -> **`User B`**.
+    *   *Result:* The device is now owned by the new empty account. The old history is "orphaned" in `User A`.
+    *   *Recovery:* User clicks "Sign in with Google". Client SDK detects `User A` exists. Logs in as `User A`.
+    *   Client: Calls `POST /register-device`.
+    *   **Backend:** Updates `D1` -> **`User A`**. History restored.
+</file>
+
 <file path="functions/src/handlers/analyzeFoodImage.ts">
 import { Request, Response } from "express";
 import { logger } from "firebase-functions/v2";
@@ -2776,6 +2630,83 @@ export async function analyzeFoodImage(
       success: true,
       nutrition,
       creditsRemaining: remainingCredits,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/handlers/registerDevice.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { upsertDevice } from "../services/firestore";
+import { trackEventAsync } from "../services/events";
+import { deviceRegistrationSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+import { EventName } from "../types/behavioral";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+
+export async function registerDevice(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    // 1. VERIFY AUTH
+    // This connects the request to the Firebase User (Anonymous or Gmail)
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Securely obtained from token
+
+    // 2. Validate input
+    const validation = validateInput(deviceRegistrationSchema, req.body);
+    if (!validation.success) {
+      throw errors.invalidRequest(validation.error);
+    }
+
+    const { deviceId, fcmToken, platform, timezone } = validation.data;
+
+    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
+
+    // 3. Upsert with UID
+    await upsertDevice(uid, deviceId, fcmToken, platform);
+
+    // 4. Track Event (Now properly attributed to the UID)
+    if (timezone) {
+      trackEventAsync({
+        eventName: EventName.DEVICE_REGISTERED,
+        userId: uid, // Use actual UID now, not deviceId
+        timestamp: new Date().toISOString(),
+        timezone,
+        platform,
+        metadata: {
+          timezone,
+          platform,
+          deviceId, // Keep deviceId in metadata for debugging
+        },
+      }).catch((err) => {
+        logger.warn("Failed to track device registration event", { error: err });
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Device registered successfully",
     });
   } catch (error) {
     handleError(error, res);
@@ -3193,6 +3124,224 @@ app.use((_req: Request, res: Response) => {
 export { app };
 </file>
 
+<file path="functions/src/handlers/sendDailyNudge.ts">
+import { logger } from "firebase-functions/v2";
+import { getActiveDevices } from "../services/firestore";
+import { sendBatchNotifications } from "../services/fcm";
+import { trackEventAsync } from "../services/events";
+import { NUDGE_TYPES, COLLECTIONS } from "../config/constants";
+import { EventName } from "../types/behavioral";
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
+
+const db = getFirestore();
+
+export type NudgeType = keyof typeof NUDGE_TYPES;
+
+/**
+ * Notification document structure (new collection)
+ */
+interface NotificationDocument {
+  notification_id: string;
+  device_id: string;
+  uid: string;
+  notification_type: string;
+  title: string;
+  body: string;
+  link: string;
+  delivery_status: "success" | "failed";
+  error_message?: string;
+  sent_at: FirebaseFirestore.Timestamp;
+}
+
+/**
+ * Log notification to 'notifications' collection
+ */
+async function logNotification(notification: NotificationDocument): Promise<void> {
+  await db.collection(COLLECTIONS.NOTIFICATIONS).add(notification);
+}
+
+/**
+ * Factory function that creates a nudge handler for a specific type.
+ * Each nudge type has its own title, body, and deep link.
+ */
+export function createNudgeHandler(nudgeType: NudgeType) {
+  return async function sendNudge(): Promise<void> {
+    const config = NUDGE_TYPES[nudgeType];
+    logger.info(`Starting ${nudgeType} nudge job`, { link: config.link });
+
+    try {
+      // Get all active devices
+      const devices = await getActiveDevices();
+      logger.info(`Found ${devices.length} active devices`);
+
+      if (devices.length === 0) {
+        logger.info("No active devices to notify");
+        return;
+      }
+
+      // Send notifications with deep link
+      const results = await sendBatchNotifications(
+        devices,
+        config.title,
+        config.body,
+        config.link,
+      );
+
+      // Log each notification result and track events
+      const logPromises = results.map(async (result) => {
+        const deliveryStatus = result.success ? "success" : "failed";
+
+        // Log to 'notifications' collection (replaces 'nudges')
+        const notificationDoc: NotificationDocument = {
+          notification_id: result.notificationId,
+          device_id: result.deviceId,
+          uid: result.uid,
+          notification_type: nudgeType,
+          title: config.title,
+          body: config.body,
+          link: config.link,
+          delivery_status: deliveryStatus,
+          ...(result.error && { error_message: result.error }),
+          sent_at: Timestamp.now(),
+        };
+
+        await logNotification(notificationDoc);
+
+        // Track NOTIFICATION_DELIVERED event (fire-and-forget)
+        trackEventAsync({
+          eventName: EventName.NOTIFICATION_DELIVERED,
+          userId: result.uid, // Use uid for user-level attribution
+          timestamp: new Date().toISOString(),
+          timezone: "UTC",
+          platform: "ios", // Default, we don't know the platform here
+          metadata: {
+            notification_id: result.notificationId,
+            notification_type: nudgeType,
+            delivery_status: deliveryStatus,
+            device_id: result.deviceId, // Keep deviceId for debugging
+            ...(result.error && { error_message: result.error }),
+          },
+        }).catch((err) => {
+          logger.warn("Failed to track notification event", {
+            notificationId: result.notificationId,
+            error: err,
+          });
+        });
+      });
+
+      await Promise.all(logPromises);
+
+      const successCount = results.filter((r) => r.success).length;
+      logger.info(`${nudgeType} nudge complete: ${successCount}/${results.length} successful`);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      logger.error(`${nudgeType} nudge failed: ${errorMessage}`);
+      throw error;
+    }
+  };
+}
+
+// Legacy export for backward compatibility
+export const sendDailyNudge = createNudgeHandler("WEIGHT_REMINDER");
+</file>
+
+<file path="functions/src/services/fcm.ts">
+import { admin } from "./firestore";
+import { logger } from "firebase-functions/v2";
+import { LIMITS } from "../config/constants";
+import { DeviceDocument } from "../types";
+
+interface SendResult {
+  deviceId: string;
+  uid: string;
+  notificationId: string;
+  success: boolean;
+  error?: string;
+}
+
+export async function sendPushNotification(
+  fcmToken: string,
+  title: string,
+  body: string,
+  notificationId: string,
+  link?: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: {
+        title,
+        body,
+      },
+      data: {
+        notification_id: notificationId,
+        ...(link && { link }),
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "weight_reminders",
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: "default",
+            badge: 1,
+          },
+        },
+      },
+    });
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.warn(`FCM send failed: ${errorMessage}`);
+    return { success: false, error: errorMessage };
+  }
+}
+
+export async function sendBatchNotifications(
+  devices: DeviceDocument[],
+  title: string,
+  body: string,
+  link?: string,
+): Promise<SendResult[]> {
+  const results: SendResult[] = [];
+
+  // Process in batches to respect FCM limits
+  for (let i = 0; i < devices.length; i += LIMITS.FCM_BATCH_SIZE) {
+    const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
+
+    const batchPromises = batch.map(async (device) => {
+      const notificationId = crypto.randomUUID();
+      const result = await sendPushNotification(
+        device.fcmToken,
+        title,
+        body,
+        notificationId,
+        link,
+      );
+      return {
+        deviceId: device.deviceId,
+        uid: device.uid,
+        notificationId,
+        success: result.success,
+        error: result.error,
+      };
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+  }
+
+  const successCount = results.filter((r) => r.success).length;
+  const failCount = results.length - successCount;
+  logger.info(`Batch send complete: ${successCount} success, ${failCount} failed`);
+
+  return results;
+}
+</file>
+
 <file path="functions/src/types/index.ts">
 // Type definitions for the weight-tracking backend
 
@@ -3275,6 +3424,835 @@ export interface BackupPayload {
     streaks?: Record<string, unknown>;
     metadata?: Record<string, unknown>;
 }
+</file>
+
+<file path="functions/src/config/constants.ts">
+// Configuration constants
+
+export const COLLECTIONS = {
+  DEVICES: "devices",
+  NUDGES: "nudges",
+  FOOD_ANALYSES: "food_analyses",
+  EVENTS: "events",
+  USERS: "users",
+  NOTIFICATIONS: "notifications",
+} as const;
+
+export const LIMITS = {
+  MAX_IMAGE_SIZE_BYTES: 5 * 1024 * 1024, // 5MB
+  DEVICE_ACTIVE_DAYS: 30, // Consider device active if seen within this many days
+  FCM_BATCH_SIZE: 500, // Max devices per FCM batch
+} as const;
+
+export const NUDGE_CONFIG = {
+  DEFAULT_TITLE: "Time to log your weight! ⚖️",
+  DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
+} as const;
+
+export const NUDGE_TYPES = {
+  WEIGHT_REMINDER: {
+    title: "Good morning! ⚖️",
+    body: "Time to log your weight",
+    link: "platewise://entry",
+  },
+  BREAKFAST: {
+    title: "Breakfast time! 🍳",
+    body: "Had breakfast? Snap a quick photo",
+    link: "platewise://food/capture",
+  },
+  LUNCH: {
+    title: "Lunch time! 🥗",
+    body: "Capture what you're eating",
+    link: "platewise://food/capture",
+  },
+  SNACKS: {
+    title: "Snack check 🍎",
+    body: "Snacking? Log it to stay on track",
+    link: "platewise://food/capture",
+  },
+  DINNER: {
+    title: "Dinner time! 🍽️",
+    body: "Don't forget to log your meal",
+    link: "platewise://food/capture",
+  },
+  EVENING_CHECKIN: {
+    title: "Daily check-in 📊",
+    body: "How was your day? Check your progress",
+    link: "platewise://dashboard",
+  },
+} as const;
+
+export const VISION_CONFIG = {
+  MODEL: "gpt-4o",
+  TEXT_MODEL: "gpt-4o", // Text-only model for Stage 2 (no vision capability needed)
+  PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
+  NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
+  MAX_TOKENS: 2048, // Legacy: single-pass mode
+  TIMEOUT_MS: 60000,
+  SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
+  PROMPT_VERSION: "vision_v4_2stage",
+  MIN_CONFIDENCE: 0.6, // Gate Stage 2 if perception confidence is below this
+} as const;
+
+export const FUNCTION_CONFIG = {
+  REGION: "us-central1",
+  TIMEOUT_SECONDS: 60,
+  MEMORY: "256MiB" as const,
+  ANALYSIS_MEMORY: "512MiB" as const,
+} as const;
+
+export const BACKUP_CONFIG = {
+  STORAGE_BUCKET: process.env.STORAGE_BUCKET || "",
+  STORAGE_PATH_PREFIX: "users",
+  BACKUP_FILENAME: "current.gz",
+} as const;
+</file>
+
+<file path="functions/src/services/vision.ts">
+import OpenAI from "openai";
+import * as crypto from "crypto";
+import { logger } from "firebase-functions/v2";
+import { defineString } from "firebase-functions/params";
+import {
+  VisionPassResult,
+  VisionErrorSchema,
+  FoodAnalysisRecord,
+  NutritionData,
+  PerceptionResult,
+  PerceptionResultSchema,
+  NutritionResult,
+  NutritionResultSchema,
+  PerceptionItem,
+} from "../types";
+import { VISION_CONFIG, COLLECTIONS } from "../config/constants";
+import { errors } from "../utils/errors";
+import { db, admin } from "./firestore";
+
+// Define the API key as a Firebase parameter
+const openaiApiKey = defineString("OPENAI_API_KEY");
+
+// =============================================================================
+// 2-STAGE PROMPTS
+// =============================================================================
+
+/* eslint-disable max-len */
+
+/**
+ * Stage 1: Vision Perception
+ * Only what requires pixels. Nothing else.
+ */
+const PERCEPTION_PROMPT = `You are a food perception system.
+
+Task:
+From the image, identify up to 5 distinct food items and estimate their
+approximate edible weight in grams.
+
+Rules:
+- Focus on visual identification only.
+- Be conservative with weight estimates.
+- Do NOT estimate nutrition.
+- Do NOT explain reasoning.
+- Do NOT infer ingredients or cooking method.
+- Output JSON only.
+
+Response format:
+{
+  "items": [
+    {
+      "foodName": "string",
+      "estimatedWeight_g": number,
+      "confidence": number between 0 and 1
+    }
+  ]
+}
+
+Error format:
+{
+  "error": "description",
+  "errorType": "NOT_FOOD" | "BLURRY" | "LOW_CONFIDENCE" | "MULTIPLE_ITEMS"
+}`;
+
+/**
+ * Stage 2: Nutrition Reasoning (Text-only)
+ * Statistical nutrition estimation from identified items.
+ */
+const NUTRITION_PROMPT = `You are a nutrition estimation system.
+
+Given the following food items and their estimated weights,
+estimate typical home-style nutrition values.
+
+Rules:
+- Use typical preparation assumptions.
+- Be conservative.
+- No explanations.
+- Output JSON only.
+
+Response format:
+{
+  "items": [
+    {
+      "foodName": "string",
+      "calories": number,
+      "protein": number,
+      "carbohydrates": number,
+      "fat": number,
+      "fiber": number
+    }
+  ]
+}`;
+
+/* eslint-enable max-len */
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/**
+ * Compute SHA-256 hash of image with byte length salt for collision safety
+ */
+function computeImageHash(imageBase64: string): { hash: string; byteLength: number } {
+  const buffer = Buffer.from(imageBase64, "base64");
+  const byteLength = buffer.length;
+  const saltedInput = `${imageBase64}:${byteLength}`;
+  const hash = crypto.createHash("sha256").update(saltedInput).digest("hex");
+  return { hash, byteLength };
+}
+
+/**
+ * Clean markdown code blocks from LLM response
+ */
+function cleanJsonResponse(content: string): string {
+  let clean = content.trim();
+  if (clean.startsWith("```json")) {
+    clean = clean.slice(7);
+  }
+  if (clean.startsWith("```")) {
+    clean = clean.slice(3);
+  }
+  if (clean.endsWith("```")) {
+    clean = clean.slice(0, -3);
+  }
+  return clean.trim();
+}
+
+/**
+ * Normalize food name between stages
+ * - lowercase
+ * - trim
+ * - basic plural handling
+ */
+function normalizeFoodName(name: string): string {
+  let normalized = name.toLowerCase().trim();
+  // Simple plural normalization
+  if (normalized.endsWith("ies") && normalized.length > 4) {
+    normalized = normalized.slice(0, -3) + "y";
+  } else if (normalized.endsWith("es") && normalized.length > 3) {
+    normalized = normalized.slice(0, -2);
+  } else if (normalized.endsWith("s") && normalized.length > 2) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+// =============================================================================
+// Error Handling
+// =============================================================================
+
+function handleAiError(errorMessage: string, errorType?: string): never {
+  const lowerMessage = errorMessage.toLowerCase();
+
+  if (errorType) {
+    switch (errorType) {
+    case "NOT_FOOD":
+      throw errors.notFood(errorMessage);
+    case "BLURRY":
+      throw errors.imageTooBlurry();
+    case "MULTIPLE_ITEMS":
+      throw errors.multipleFoods();
+    case "LOW_CONFIDENCE":
+      throw errors.lowConfidence();
+    default:
+      throw errors.analysisFailed(errorMessage);
+    }
+  }
+
+  if (lowerMessage.includes("not food") || lowerMessage.includes("no food")) {
+    throw errors.notFood(errorMessage);
+  }
+  if (lowerMessage.includes("blurry") || lowerMessage.includes("unclear")) {
+    throw errors.imageTooBlurry();
+  }
+  if (lowerMessage.includes("cannot identify") || lowerMessage.includes("not sure")) {
+    throw errors.lowConfidence();
+  }
+
+  throw errors.analysisFailed(errorMessage);
+}
+
+// =============================================================================
+// Stage 1: Vision Perception
+// =============================================================================
+
+interface PerceptionOutput {
+  rawText: string;
+  parsed: PerceptionResult;
+  durationMs: number;
+}
+
+/**
+ * Stage 1: Identify food items and estimate weights from image.
+ * Uses vision model with tight token limit.
+ */
+async function runVisionPerception(
+  openai: OpenAI,
+  imageBase64: string,
+): Promise<PerceptionOutput> {
+  const startTime = Date.now();
+
+  const response = await openai.chat.completions.create({
+    model: VISION_CONFIG.MODEL,
+    max_completion_tokens: VISION_CONFIG.PERCEPTION_MAX_TOKENS,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: PERCEPTION_PROMPT },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:image/jpeg;base64,${imageBase64}`,
+              detail: "low",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const durationMs = Date.now() - startTime;
+  const rawText = response.choices[0]?.message?.content;
+
+  if (!rawText) {
+    throw errors.aiServiceError();
+  }
+
+  const cleanContent = cleanJsonResponse(rawText);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(cleanContent);
+  } catch {
+    logger.error("Failed to parse perception response", { rawText });
+    throw errors.parseError();
+  }
+
+  // Check for error response
+  const errorResult = VisionErrorSchema.safeParse(parsed);
+  if (errorResult.success) {
+    handleAiError(errorResult.data.error, errorResult.data.errorType);
+  }
+
+  // Parse as perception result
+  const successResult = PerceptionResultSchema.safeParse(parsed);
+  if (!successResult.success) {
+    logger.error("Perception response validation failed", {
+      errors: successResult.error.issues,
+      rawText,
+    });
+    throw errors.parseError();
+  }
+
+  logger.info("Stage 1 (Perception) complete", {
+    itemCount: successResult.data.items.length,
+    durationMs,
+  });
+
+  return { rawText, parsed: successResult.data, durationMs };
+}
+
+// =============================================================================
+// Stage 2: Nutrition Reasoning (Text-only)
+// =============================================================================
+
+interface NutritionOutput {
+  rawText: string;
+  parsed: NutritionResult;
+  durationMs: number;
+}
+
+/**
+ * Stage 2: Estimate nutrition from identified food items.
+ * Text-only model call - no image context.
+ */
+async function runNutritionText(
+  openai: OpenAI,
+  items: PerceptionItem[],
+): Promise<NutritionOutput> {
+  const startTime = Date.now();
+
+  // Prepare input with normalized food names
+  const input = items.map((item) => ({
+    foodName: item.foodName,
+    estimatedWeight_g: item.estimatedWeight_g,
+  }));
+
+  const response = await openai.chat.completions.create({
+    model: VISION_CONFIG.TEXT_MODEL, // Explicitly mark as text-only
+    max_completion_tokens: VISION_CONFIG.NUTRITION_MAX_TOKENS,
+    messages: [
+      {
+        role: "user",
+        content: `${NUTRITION_PROMPT}\n\nInput:\n${JSON.stringify(input, null, 2)}`,
+      },
+    ],
+  });
+
+  const durationMs = Date.now() - startTime;
+  const rawText = response.choices[0]?.message?.content;
+
+  if (!rawText) {
+    throw errors.aiServiceError();
+  }
+
+  const cleanContent = cleanJsonResponse(rawText);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(cleanContent);
+  } catch {
+    logger.error("Failed to parse nutrition response", { rawText });
+    throw errors.parseError();
+  }
+
+  // Parse as nutrition result
+  const successResult = NutritionResultSchema.safeParse(parsed);
+  if (!successResult.success) {
+    logger.error("Nutrition response validation failed", {
+      errors: successResult.error.issues,
+      rawText,
+    });
+    throw errors.parseError();
+  }
+
+  logger.info("Stage 2 (Nutrition) complete", {
+    itemCount: successResult.data.items.length,
+    durationMs,
+  });
+
+  return { rawText, parsed: successResult.data, durationMs };
+}
+
+// =============================================================================
+// Confidence Gating
+// =============================================================================
+
+/**
+ * Gate Stage 2 execution based on perception confidence.
+ * Throws LOW_CONFIDENCE if any item is below threshold.
+ */
+function validatePerceptionConfidence(items: PerceptionItem[]): void {
+  const minConfidence = Math.min(...items.map((i) => i.confidence));
+
+  if (minConfidence < VISION_CONFIG.MIN_CONFIDENCE) {
+    logger.warn("Perception confidence too low, aborting Stage 2", {
+      minConfidence,
+      threshold: VISION_CONFIG.MIN_CONFIDENCE,
+    });
+    throw errors.lowConfidence();
+  }
+}
+
+// =============================================================================
+// Merge Results to VisionPassResult (backward compatibility)
+// =============================================================================
+
+/**
+ * Merge perception and nutrition outputs into VisionPassResult format.
+ * This maintains backward compatibility with existing persistence and aggregation.
+ */
+function mergeToVisionPassResult(
+  perception: PerceptionResult,
+  nutrition: NutritionResult,
+): VisionPassResult {
+  // Create a map of normalized food names to nutrition data
+  const nutritionMap = new Map<string, NutritionResult["items"][0]>();
+  for (const item of nutrition.items) {
+    nutritionMap.set(normalizeFoodName(item.foodName), item);
+  }
+
+  // Merge perception items with nutrition data
+  const items = perception.items.map((pItem) => {
+    const normalizedName = normalizeFoodName(pItem.foodName);
+    const nItem = nutritionMap.get(normalizedName);
+
+    // Default nutrition if not found (shouldn't happen but be safe)
+    const calories = nItem?.calories ?? 0;
+    const protein = nItem?.protein ?? 0;
+    const carbohydrates = nItem?.carbohydrates ?? 0;
+    const fat = nItem?.fat ?? 0;
+    const fiber = nItem?.fiber ?? 0;
+
+    return {
+      foodName: pItem.foodName,
+      estimatedWeight_g: pItem.estimatedWeight_g,
+      calories,
+      protein,
+      carbohydrates,
+      fat,
+      fiber,
+      // Placeholder canonical data (not used in 2-stage mode)
+      _canonical: {
+        cuisine: "unknown",
+        baseIngredients: [],
+        cookingMethod: "unknown",
+        density: "medium" as const,
+        moisture: "moist" as const,
+        processingLevel: "minimal" as const,
+      },
+      _debug: {
+        confidence: pItem.confidence,
+        visualCues: [],
+      },
+    };
+  });
+
+  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
+  const totalCalories = items.reduce((sum, i) => sum + i.calories, 0);
+
+  return {
+    items,
+    totalWeight_g: totalWeight,
+    totalCalories,
+  };
+}
+
+// =============================================================================
+// Persistence
+// =============================================================================
+
+async function persistAnalysis(record: FoodAnalysisRecord): Promise<void> {
+  try {
+    await db.collection(COLLECTIONS.FOOD_ANALYSES).add({
+      ...record,
+      createdAt: admin.firestore.Timestamp.fromDate(record.createdAt),
+    });
+    logger.info("Persisted food analysis", {
+      imageHash: record.imageHash,
+      status: record.status,
+      itemCount: record.finalResult.items.length,
+    });
+  } catch (err) {
+    logger.error("Failed to persist food analysis", { error: err });
+    // Don't throw - persistence failure shouldn't block response
+  }
+}
+
+// =============================================================================
+// Legacy Aggregation (Backward Compatibility)
+// =============================================================================
+
+function aggregateToLegacy(result: VisionPassResult): NutritionData {
+  const totalProtein = result.items.reduce((sum, i) => sum + i.protein, 0);
+  const totalCarbs = result.items.reduce((sum, i) => sum + i.carbohydrates, 0);
+  const totalFat = result.items.reduce((sum, i) => sum + i.fat, 0);
+  const totalFiber = result.items.reduce((sum, i) => sum + i.fiber, 0);
+
+  const foodName = result.items.length === 1 ?
+    result.items[0].foodName :
+    "Mixed meal";
+
+  return {
+    foodName,
+    calories: result.totalCalories,
+    protein: Math.round(totalProtein * 10) / 10,
+    carbohydrates: Math.round(totalCarbs * 10) / 10,
+    fat: Math.round(totalFat * 10) / 10,
+    fiber: Math.round(totalFiber * 10) / 10,
+    estimatedServingSize: `${result.totalWeight_g}g`,
+  };
+}
+
+// =============================================================================
+// Main Entry Point: 2-Stage Pipeline
+// =============================================================================
+
+export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
+  const startTime = Date.now();
+  const apiKey = openaiApiKey.value();
+
+  if (!apiKey) {
+    throw errors.aiConfigError();
+  }
+
+  const openai = new OpenAI({ apiKey });
+  const { hash: imageHash, byteLength: imageByteLength } = computeImageHash(imageBase64);
+
+  logger.info("Starting 2-stage food analysis", { imageHash });
+
+  // ==========================================================================
+  // Stage 1: Vision Perception
+  // ==========================================================================
+  let perception: PerceptionOutput;
+  try {
+    perception = await runVisionPerception(openai, imageBase64);
+  } catch (err) {
+    logger.error("Stage 1 (Perception) failed", { error: err });
+    throw err;
+  }
+
+  // ==========================================================================
+  // Confidence Gate
+  // ==========================================================================
+  validatePerceptionConfidence(perception.parsed.items);
+
+  // ==========================================================================
+  // Stage 2: Nutrition Reasoning (Text-only)
+  // ==========================================================================
+  let nutrition: NutritionOutput;
+  try {
+    nutrition = await runNutritionText(openai, perception.parsed.items);
+  } catch (err) {
+    logger.error("Stage 2 (Nutrition) failed", { error: err });
+    throw err;
+  }
+
+  // ==========================================================================
+  // Merge Results
+  // ==========================================================================
+  const finalResult = mergeToVisionPassResult(perception.parsed, nutrition.parsed);
+  const totalDurationMs = Date.now() - startTime;
+
+  logger.info("2-stage analysis complete", {
+    itemCount: finalResult.items.length,
+    totalCalories: finalResult.totalCalories,
+    perceptionMs: perception.durationMs,
+    nutritionMs: nutrition.durationMs,
+    totalMs: totalDurationMs,
+  });
+
+  // ==========================================================================
+  // Persist Analysis Record
+  // ==========================================================================
+  const record: FoodAnalysisRecord = {
+    imageHash,
+    imageByteLength,
+    model: VISION_CONFIG.MODEL,
+    promptVersion: VISION_CONFIG.PROMPT_VERSION,
+
+    // Stage 1: Perception
+    perceptionRawText: perception.rawText,
+    perceptionParsed: perception.parsed,
+    perceptionDurationMs: perception.durationMs,
+
+    // Stage 2: Nutrition
+    nutritionRawText: nutrition.rawText,
+    nutritionParsed: nutrition.parsed,
+    nutritionDurationMs: nutrition.durationMs,
+
+    // Final result
+    status: "TWO_STAGE",
+    finalResult,
+    createdAt: new Date(),
+    durationMs: totalDurationMs,
+  };
+
+  await persistAnalysis(record);
+
+  // Aggregate to legacy format for backward compatibility
+  return aggregateToLegacy(finalResult);
+}
+
+// =============================================================================
+// Quick Scan: Single-Stage Lightweight Analysis
+// =============================================================================
+
+const DAILY_CALORIE_TARGET = 2000;
+const AVG_KCAL_PER_GRAM = 1.5; // Conservative average for mixed foods
+
+/**
+ * Map numeric confidence to categorical level
+ */
+function mapConfidenceLevel(confidence: number): "high" | "medium" | "low" {
+  if (confidence >= 0.8) return "high";
+  if (confidence >= 0.6) return "medium";
+  return "low";
+}
+
+/**
+ * Generate one-liner message about calorie percentage
+ */
+function generateCalorieMessage(calories: number): string {
+  const percentage = Math.round((calories / DAILY_CALORIE_TARGET) * 100);
+  return `That's ${percentage}% of a typical daily target`;
+}
+
+/**
+ * Quick food scan - lightweight single-stage analysis
+ * Returns simplified results: food name, confidence, estimated calories, one-liner
+ *
+ * Uses only Stage 1 (perception) for speed.
+ * Does NOT persist to Firestore.
+ */
+export async function quickAnalyzeFood(imageBase64: string): Promise<{
+  foodName: string;
+  confidence: "high" | "medium" | "low";
+  calories: number;
+  message: string;
+}> {
+  const startTime = Date.now();
+  const apiKey = openaiApiKey.value();
+
+  if (!apiKey) {
+    throw errors.aiConfigError();
+  }
+
+  const openai = new OpenAI({ apiKey });
+  const { hash: imageHash } = computeImageHash(imageBase64);
+
+  logger.info("Starting quick food scan", { imageHash });
+
+  // Run Stage 1 only (perception)
+  const perception = await runVisionPerception(openai, imageBase64);
+
+  // Aggregate items if multiple detected
+  const items = perception.parsed.items;
+  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
+  const avgConfidence = items.reduce((sum, i) => sum + i.confidence, 0) / items.length;
+
+  // Generate food name
+  const foodName = items.length === 1 ?
+    items[0].foodName :
+    items.map((i) => i.foodName).join(" + ");
+
+  // Rough calorie estimate based on weight
+  const calories = Math.round(totalWeight * AVG_KCAL_PER_GRAM);
+
+  const durationMs = Date.now() - startTime;
+
+  logger.info("Quick scan complete", {
+    foodName,
+    calories,
+    confidence: mapConfidenceLevel(avgConfidence),
+    durationMs,
+  });
+
+  return {
+    foodName,
+    confidence: mapConfidenceLevel(avgConfidence),
+    calories,
+    message: generateCalorieMessage(calories),
+  };
+}
+</file>
+
+<file path="functions/src/index.ts">
+import { onRequest } from "firebase-functions/v2/https";
+import { onSchedule } from "firebase-functions/v2/scheduler";
+import { setGlobalOptions } from "firebase-functions/v2";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { createNudgeHandler } from "./handlers/sendDailyNudge";
+import { app } from "./api";
+import { FUNCTION_CONFIG } from "./config/constants";
+
+// Initialize Firebase Admin SDK (only if not already initialized)
+if (getApps().length === 0) {
+  initializeApp();
+}
+
+// Set global options for all functions
+setGlobalOptions({
+  region: FUNCTION_CONFIG.REGION,
+  timeoutSeconds: FUNCTION_CONFIG.TIMEOUT_SECONDS,
+});
+
+/**
+ * Consolidated API Endpoint
+ *
+ * Single Express app serving all HTTP routes:
+ * - POST /register-device  (public)
+ * - POST /analyze-food     (auth)
+ * - POST /quick-scan       (auth)
+ * - POST /backup           (auth)
+ * - POST /restore          (auth)
+ * - GET  /backup-status    (auth)
+ * - GET  /credits          (auth)
+ * - GET  /user/me          (auth)
+ * - GET  /health           (public)
+ *
+ * invoker: 'public' is safe because all protected routes
+ * enforce Firebase Auth via verifyAuth middleware.
+ */
+export const api = onRequest(
+  {
+    memory: FUNCTION_CONFIG.ANALYSIS_MEMORY, // 512MiB for vision workload
+    timeoutSeconds: 60,
+    invoker: "public",
+  },
+  app,
+);
+
+// =============================================================================
+// Scheduled Push Notifications (IST times)
+// =============================================================================
+
+const SCHEDULE_CONFIG = {
+  timeZone: "Asia/Kolkata",
+  memory: FUNCTION_CONFIG.MEMORY,
+} as const;
+
+/**
+ * Weight Reminder - 7:30 AM IST
+ * Opens: platewise://entry
+ */
+export const weightReminder = onSchedule(
+  { schedule: "30 7 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("WEIGHT_REMINDER"),
+);
+
+/**
+ * Breakfast Reminder - 8:30 AM IST
+ * Opens: platewise://food/capture
+ */
+export const breakfastReminder = onSchedule(
+  { schedule: "30 8 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("BREAKFAST"),
+);
+
+/**
+ * Lunch Reminder - 1:00 PM IST
+ * Opens: platewise://food/capture
+ */
+export const lunchReminder = onSchedule(
+  { schedule: "0 13 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("LUNCH"),
+);
+
+/**
+ * Snacks Reminder - 5:00 PM IST
+ * Opens: platewise://food/capture
+ */
+export const snacksReminder = onSchedule(
+  { schedule: "0 17 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("SNACKS"),
+);
+
+/**
+ * Dinner Reminder - 8:30 PM IST
+ * Opens: platewise://food/capture
+ */
+export const dinnerReminder = onSchedule(
+  { schedule: "30 20 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("DINNER"),
+);
+
+/**
+ * Evening Check-in - 9:30 PM IST
+ * Opens: platewise://dashboard
+ */
+export const eveningCheckin = onSchedule(
+  { schedule: "30 21 * * *", ...SCHEDULE_CONFIG },
+  createNudgeHandler("EVENING_CHECKIN"),
+);
 </file>
 
 <file path="integration.md">
@@ -4231,12 +5209,22 @@ await trackEvent('INTENT_CLOSED', {
   expected_duration: closedIntent.expected_duration,
 });
 
+// Example: Notification opened (in push notification handler)
+// The notification_id is automatically included in the FCM data payload
+await trackEvent('NOTIFICATION_OPENED', {
+  notification_id: notification.data.notification_id, // Provided by backend
+  opened_at: new Date().toISOString(),
+});
+
 // Example: Notification received (in push handler)
 await trackEvent('NOTIFICATION_RECEIVED', {
   notification_id: notification.data.notification_id,
   received_at: new Date().toISOString(),
 });
 ```
+
+> [!NOTE]
+> **Notification ID Tracking:** All push notifications sent by the backend include a `notification_id` field in the FCM data payload. Use this ID when tracking `NOTIFICATION_RECEIVED` and `NOTIFICATION_OPENED` events to correlate user engagement with specific notifications.
 
 #### Client Requirements
 
@@ -4428,835 +5416,6 @@ Recommended user-facing messages for common errors:
 ## Support
 
 For issues or questions, contact the backend team or file an issue in the repository.
-</file>
-
-<file path="functions/src/config/constants.ts">
-// Configuration constants
-
-export const COLLECTIONS = {
-  DEVICES: "devices",
-  NUDGES: "nudges",
-  FOOD_ANALYSES: "food_analyses",
-  EVENTS: "events",
-  USERS: "users",
-  NOTIFICATIONS: "notifications",
-} as const;
-
-export const LIMITS = {
-  MAX_IMAGE_SIZE_BYTES: 5 * 1024 * 1024, // 5MB
-  DEVICE_ACTIVE_DAYS: 30, // Consider device active if seen within this many days
-  FCM_BATCH_SIZE: 500, // Max devices per FCM batch
-} as const;
-
-export const NUDGE_CONFIG = {
-  DEFAULT_TITLE: "Time to log your weight! ⚖️",
-  DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
-} as const;
-
-export const NUDGE_TYPES = {
-  WEIGHT_REMINDER: {
-    title: "Good morning! ⚖️",
-    body: "Time to log your weight",
-    link: "platewise://entry",
-  },
-  BREAKFAST: {
-    title: "Breakfast time! 🍳",
-    body: "Had breakfast? Snap a quick photo",
-    link: "platewise://food/capture",
-  },
-  LUNCH: {
-    title: "Lunch time! 🥗",
-    body: "Capture what you're eating",
-    link: "platewise://food/capture",
-  },
-  SNACKS: {
-    title: "Snack check 🍎",
-    body: "Snacking? Log it to stay on track",
-    link: "platewise://food/capture",
-  },
-  DINNER: {
-    title: "Dinner time! 🍽️",
-    body: "Don't forget to log your meal",
-    link: "platewise://food/capture",
-  },
-  EVENING_CHECKIN: {
-    title: "Daily check-in 📊",
-    body: "How was your day? Check your progress",
-    link: "platewise://dashboard",
-  },
-} as const;
-
-export const VISION_CONFIG = {
-  MODEL: "gpt-4o",
-  TEXT_MODEL: "gpt-4o", // Text-only model for Stage 2 (no vision capability needed)
-  PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
-  NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
-  MAX_TOKENS: 2048, // Legacy: single-pass mode
-  TIMEOUT_MS: 60000,
-  SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
-  PROMPT_VERSION: "vision_v4_2stage",
-  MIN_CONFIDENCE: 0.6, // Gate Stage 2 if perception confidence is below this
-} as const;
-
-export const FUNCTION_CONFIG = {
-  REGION: "us-central1",
-  TIMEOUT_SECONDS: 60,
-  MEMORY: "256MiB" as const,
-  ANALYSIS_MEMORY: "512MiB" as const,
-} as const;
-
-export const BACKUP_CONFIG = {
-  STORAGE_BUCKET: process.env.STORAGE_BUCKET || "",
-  STORAGE_PATH_PREFIX: "users",
-  BACKUP_FILENAME: "current.gz",
-} as const;
-</file>
-
-<file path="functions/src/services/vision.ts">
-import OpenAI from "openai";
-import * as crypto from "crypto";
-import { logger } from "firebase-functions/v2";
-import { defineString } from "firebase-functions/params";
-import {
-  VisionPassResult,
-  VisionErrorSchema,
-  FoodAnalysisRecord,
-  NutritionData,
-  PerceptionResult,
-  PerceptionResultSchema,
-  NutritionResult,
-  NutritionResultSchema,
-  PerceptionItem,
-} from "../types";
-import { VISION_CONFIG, COLLECTIONS } from "../config/constants";
-import { errors } from "../utils/errors";
-import { db, admin } from "./firestore";
-
-// Define the API key as a Firebase parameter
-const openaiApiKey = defineString("OPENAI_API_KEY");
-
-// =============================================================================
-// 2-STAGE PROMPTS
-// =============================================================================
-
-/* eslint-disable max-len */
-
-/**
- * Stage 1: Vision Perception
- * Only what requires pixels. Nothing else.
- */
-const PERCEPTION_PROMPT = `You are a food perception system.
-
-Task:
-From the image, identify up to 5 distinct food items and estimate their
-approximate edible weight in grams.
-
-Rules:
-- Focus on visual identification only.
-- Be conservative with weight estimates.
-- Do NOT estimate nutrition.
-- Do NOT explain reasoning.
-- Do NOT infer ingredients or cooking method.
-- Output JSON only.
-
-Response format:
-{
-  "items": [
-    {
-      "foodName": "string",
-      "estimatedWeight_g": number,
-      "confidence": number between 0 and 1
-    }
-  ]
-}
-
-Error format:
-{
-  "error": "description",
-  "errorType": "NOT_FOOD" | "BLURRY" | "LOW_CONFIDENCE" | "MULTIPLE_ITEMS"
-}`;
-
-/**
- * Stage 2: Nutrition Reasoning (Text-only)
- * Statistical nutrition estimation from identified items.
- */
-const NUTRITION_PROMPT = `You are a nutrition estimation system.
-
-Given the following food items and their estimated weights,
-estimate typical home-style nutrition values.
-
-Rules:
-- Use typical preparation assumptions.
-- Be conservative.
-- No explanations.
-- Output JSON only.
-
-Response format:
-{
-  "items": [
-    {
-      "foodName": "string",
-      "calories": number,
-      "protein": number,
-      "carbohydrates": number,
-      "fat": number,
-      "fiber": number
-    }
-  ]
-}`;
-
-/* eslint-enable max-len */
-
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-/**
- * Compute SHA-256 hash of image with byte length salt for collision safety
- */
-function computeImageHash(imageBase64: string): { hash: string; byteLength: number } {
-  const buffer = Buffer.from(imageBase64, "base64");
-  const byteLength = buffer.length;
-  const saltedInput = `${imageBase64}:${byteLength}`;
-  const hash = crypto.createHash("sha256").update(saltedInput).digest("hex");
-  return { hash, byteLength };
-}
-
-/**
- * Clean markdown code blocks from LLM response
- */
-function cleanJsonResponse(content: string): string {
-  let clean = content.trim();
-  if (clean.startsWith("```json")) {
-    clean = clean.slice(7);
-  }
-  if (clean.startsWith("```")) {
-    clean = clean.slice(3);
-  }
-  if (clean.endsWith("```")) {
-    clean = clean.slice(0, -3);
-  }
-  return clean.trim();
-}
-
-/**
- * Normalize food name between stages
- * - lowercase
- * - trim
- * - basic plural handling
- */
-function normalizeFoodName(name: string): string {
-  let normalized = name.toLowerCase().trim();
-  // Simple plural normalization
-  if (normalized.endsWith("ies") && normalized.length > 4) {
-    normalized = normalized.slice(0, -3) + "y";
-  } else if (normalized.endsWith("es") && normalized.length > 3) {
-    normalized = normalized.slice(0, -2);
-  } else if (normalized.endsWith("s") && normalized.length > 2) {
-    normalized = normalized.slice(0, -1);
-  }
-  return normalized;
-}
-
-// =============================================================================
-// Error Handling
-// =============================================================================
-
-function handleAiError(errorMessage: string, errorType?: string): never {
-  const lowerMessage = errorMessage.toLowerCase();
-
-  if (errorType) {
-    switch (errorType) {
-    case "NOT_FOOD":
-      throw errors.notFood(errorMessage);
-    case "BLURRY":
-      throw errors.imageTooBlurry();
-    case "MULTIPLE_ITEMS":
-      throw errors.multipleFoods();
-    case "LOW_CONFIDENCE":
-      throw errors.lowConfidence();
-    default:
-      throw errors.analysisFailed(errorMessage);
-    }
-  }
-
-  if (lowerMessage.includes("not food") || lowerMessage.includes("no food")) {
-    throw errors.notFood(errorMessage);
-  }
-  if (lowerMessage.includes("blurry") || lowerMessage.includes("unclear")) {
-    throw errors.imageTooBlurry();
-  }
-  if (lowerMessage.includes("cannot identify") || lowerMessage.includes("not sure")) {
-    throw errors.lowConfidence();
-  }
-
-  throw errors.analysisFailed(errorMessage);
-}
-
-// =============================================================================
-// Stage 1: Vision Perception
-// =============================================================================
-
-interface PerceptionOutput {
-  rawText: string;
-  parsed: PerceptionResult;
-  durationMs: number;
-}
-
-/**
- * Stage 1: Identify food items and estimate weights from image.
- * Uses vision model with tight token limit.
- */
-async function runVisionPerception(
-  openai: OpenAI,
-  imageBase64: string,
-): Promise<PerceptionOutput> {
-  const startTime = Date.now();
-
-  const response = await openai.chat.completions.create({
-    model: VISION_CONFIG.MODEL,
-    max_completion_tokens: VISION_CONFIG.PERCEPTION_MAX_TOKENS,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: PERCEPTION_PROMPT },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:image/jpeg;base64,${imageBase64}`,
-              detail: "low",
-            },
-          },
-        ],
-      },
-    ],
-  });
-
-  const durationMs = Date.now() - startTime;
-  const rawText = response.choices[0]?.message?.content;
-
-  if (!rawText) {
-    throw errors.aiServiceError();
-  }
-
-  const cleanContent = cleanJsonResponse(rawText);
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(cleanContent);
-  } catch {
-    logger.error("Failed to parse perception response", { rawText });
-    throw errors.parseError();
-  }
-
-  // Check for error response
-  const errorResult = VisionErrorSchema.safeParse(parsed);
-  if (errorResult.success) {
-    handleAiError(errorResult.data.error, errorResult.data.errorType);
-  }
-
-  // Parse as perception result
-  const successResult = PerceptionResultSchema.safeParse(parsed);
-  if (!successResult.success) {
-    logger.error("Perception response validation failed", {
-      errors: successResult.error.issues,
-      rawText,
-    });
-    throw errors.parseError();
-  }
-
-  logger.info("Stage 1 (Perception) complete", {
-    itemCount: successResult.data.items.length,
-    durationMs,
-  });
-
-  return { rawText, parsed: successResult.data, durationMs };
-}
-
-// =============================================================================
-// Stage 2: Nutrition Reasoning (Text-only)
-// =============================================================================
-
-interface NutritionOutput {
-  rawText: string;
-  parsed: NutritionResult;
-  durationMs: number;
-}
-
-/**
- * Stage 2: Estimate nutrition from identified food items.
- * Text-only model call - no image context.
- */
-async function runNutritionText(
-  openai: OpenAI,
-  items: PerceptionItem[],
-): Promise<NutritionOutput> {
-  const startTime = Date.now();
-
-  // Prepare input with normalized food names
-  const input = items.map((item) => ({
-    foodName: item.foodName,
-    estimatedWeight_g: item.estimatedWeight_g,
-  }));
-
-  const response = await openai.chat.completions.create({
-    model: VISION_CONFIG.TEXT_MODEL, // Explicitly mark as text-only
-    max_completion_tokens: VISION_CONFIG.NUTRITION_MAX_TOKENS,
-    messages: [
-      {
-        role: "user",
-        content: `${NUTRITION_PROMPT}\n\nInput:\n${JSON.stringify(input, null, 2)}`,
-      },
-    ],
-  });
-
-  const durationMs = Date.now() - startTime;
-  const rawText = response.choices[0]?.message?.content;
-
-  if (!rawText) {
-    throw errors.aiServiceError();
-  }
-
-  const cleanContent = cleanJsonResponse(rawText);
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(cleanContent);
-  } catch {
-    logger.error("Failed to parse nutrition response", { rawText });
-    throw errors.parseError();
-  }
-
-  // Parse as nutrition result
-  const successResult = NutritionResultSchema.safeParse(parsed);
-  if (!successResult.success) {
-    logger.error("Nutrition response validation failed", {
-      errors: successResult.error.issues,
-      rawText,
-    });
-    throw errors.parseError();
-  }
-
-  logger.info("Stage 2 (Nutrition) complete", {
-    itemCount: successResult.data.items.length,
-    durationMs,
-  });
-
-  return { rawText, parsed: successResult.data, durationMs };
-}
-
-// =============================================================================
-// Confidence Gating
-// =============================================================================
-
-/**
- * Gate Stage 2 execution based on perception confidence.
- * Throws LOW_CONFIDENCE if any item is below threshold.
- */
-function validatePerceptionConfidence(items: PerceptionItem[]): void {
-  const minConfidence = Math.min(...items.map((i) => i.confidence));
-
-  if (minConfidence < VISION_CONFIG.MIN_CONFIDENCE) {
-    logger.warn("Perception confidence too low, aborting Stage 2", {
-      minConfidence,
-      threshold: VISION_CONFIG.MIN_CONFIDENCE,
-    });
-    throw errors.lowConfidence();
-  }
-}
-
-// =============================================================================
-// Merge Results to VisionPassResult (backward compatibility)
-// =============================================================================
-
-/**
- * Merge perception and nutrition outputs into VisionPassResult format.
- * This maintains backward compatibility with existing persistence and aggregation.
- */
-function mergeToVisionPassResult(
-  perception: PerceptionResult,
-  nutrition: NutritionResult,
-): VisionPassResult {
-  // Create a map of normalized food names to nutrition data
-  const nutritionMap = new Map<string, NutritionResult["items"][0]>();
-  for (const item of nutrition.items) {
-    nutritionMap.set(normalizeFoodName(item.foodName), item);
-  }
-
-  // Merge perception items with nutrition data
-  const items = perception.items.map((pItem) => {
-    const normalizedName = normalizeFoodName(pItem.foodName);
-    const nItem = nutritionMap.get(normalizedName);
-
-    // Default nutrition if not found (shouldn't happen but be safe)
-    const calories = nItem?.calories ?? 0;
-    const protein = nItem?.protein ?? 0;
-    const carbohydrates = nItem?.carbohydrates ?? 0;
-    const fat = nItem?.fat ?? 0;
-    const fiber = nItem?.fiber ?? 0;
-
-    return {
-      foodName: pItem.foodName,
-      estimatedWeight_g: pItem.estimatedWeight_g,
-      calories,
-      protein,
-      carbohydrates,
-      fat,
-      fiber,
-      // Placeholder canonical data (not used in 2-stage mode)
-      _canonical: {
-        cuisine: "unknown",
-        baseIngredients: [],
-        cookingMethod: "unknown",
-        density: "medium" as const,
-        moisture: "moist" as const,
-        processingLevel: "minimal" as const,
-      },
-      _debug: {
-        confidence: pItem.confidence,
-        visualCues: [],
-      },
-    };
-  });
-
-  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
-  const totalCalories = items.reduce((sum, i) => sum + i.calories, 0);
-
-  return {
-    items,
-    totalWeight_g: totalWeight,
-    totalCalories,
-  };
-}
-
-// =============================================================================
-// Persistence
-// =============================================================================
-
-async function persistAnalysis(record: FoodAnalysisRecord): Promise<void> {
-  try {
-    await db.collection(COLLECTIONS.FOOD_ANALYSES).add({
-      ...record,
-      createdAt: admin.firestore.Timestamp.fromDate(record.createdAt),
-    });
-    logger.info("Persisted food analysis", {
-      imageHash: record.imageHash,
-      status: record.status,
-      itemCount: record.finalResult.items.length,
-    });
-  } catch (err) {
-    logger.error("Failed to persist food analysis", { error: err });
-    // Don't throw - persistence failure shouldn't block response
-  }
-}
-
-// =============================================================================
-// Legacy Aggregation (Backward Compatibility)
-// =============================================================================
-
-function aggregateToLegacy(result: VisionPassResult): NutritionData {
-  const totalProtein = result.items.reduce((sum, i) => sum + i.protein, 0);
-  const totalCarbs = result.items.reduce((sum, i) => sum + i.carbohydrates, 0);
-  const totalFat = result.items.reduce((sum, i) => sum + i.fat, 0);
-  const totalFiber = result.items.reduce((sum, i) => sum + i.fiber, 0);
-
-  const foodName = result.items.length === 1 ?
-    result.items[0].foodName :
-    "Mixed meal";
-
-  return {
-    foodName,
-    calories: result.totalCalories,
-    protein: Math.round(totalProtein * 10) / 10,
-    carbohydrates: Math.round(totalCarbs * 10) / 10,
-    fat: Math.round(totalFat * 10) / 10,
-    fiber: Math.round(totalFiber * 10) / 10,
-    estimatedServingSize: `${result.totalWeight_g}g`,
-  };
-}
-
-// =============================================================================
-// Main Entry Point: 2-Stage Pipeline
-// =============================================================================
-
-export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
-  const startTime = Date.now();
-  const apiKey = openaiApiKey.value();
-
-  if (!apiKey) {
-    throw errors.aiConfigError();
-  }
-
-  const openai = new OpenAI({ apiKey });
-  const { hash: imageHash, byteLength: imageByteLength } = computeImageHash(imageBase64);
-
-  logger.info("Starting 2-stage food analysis", { imageHash });
-
-  // ==========================================================================
-  // Stage 1: Vision Perception
-  // ==========================================================================
-  let perception: PerceptionOutput;
-  try {
-    perception = await runVisionPerception(openai, imageBase64);
-  } catch (err) {
-    logger.error("Stage 1 (Perception) failed", { error: err });
-    throw err;
-  }
-
-  // ==========================================================================
-  // Confidence Gate
-  // ==========================================================================
-  validatePerceptionConfidence(perception.parsed.items);
-
-  // ==========================================================================
-  // Stage 2: Nutrition Reasoning (Text-only)
-  // ==========================================================================
-  let nutrition: NutritionOutput;
-  try {
-    nutrition = await runNutritionText(openai, perception.parsed.items);
-  } catch (err) {
-    logger.error("Stage 2 (Nutrition) failed", { error: err });
-    throw err;
-  }
-
-  // ==========================================================================
-  // Merge Results
-  // ==========================================================================
-  const finalResult = mergeToVisionPassResult(perception.parsed, nutrition.parsed);
-  const totalDurationMs = Date.now() - startTime;
-
-  logger.info("2-stage analysis complete", {
-    itemCount: finalResult.items.length,
-    totalCalories: finalResult.totalCalories,
-    perceptionMs: perception.durationMs,
-    nutritionMs: nutrition.durationMs,
-    totalMs: totalDurationMs,
-  });
-
-  // ==========================================================================
-  // Persist Analysis Record
-  // ==========================================================================
-  const record: FoodAnalysisRecord = {
-    imageHash,
-    imageByteLength,
-    model: VISION_CONFIG.MODEL,
-    promptVersion: VISION_CONFIG.PROMPT_VERSION,
-
-    // Stage 1: Perception
-    perceptionRawText: perception.rawText,
-    perceptionParsed: perception.parsed,
-    perceptionDurationMs: perception.durationMs,
-
-    // Stage 2: Nutrition
-    nutritionRawText: nutrition.rawText,
-    nutritionParsed: nutrition.parsed,
-    nutritionDurationMs: nutrition.durationMs,
-
-    // Final result
-    status: "TWO_STAGE",
-    finalResult,
-    createdAt: new Date(),
-    durationMs: totalDurationMs,
-  };
-
-  await persistAnalysis(record);
-
-  // Aggregate to legacy format for backward compatibility
-  return aggregateToLegacy(finalResult);
-}
-
-// =============================================================================
-// Quick Scan: Single-Stage Lightweight Analysis
-// =============================================================================
-
-const DAILY_CALORIE_TARGET = 2000;
-const AVG_KCAL_PER_GRAM = 1.5; // Conservative average for mixed foods
-
-/**
- * Map numeric confidence to categorical level
- */
-function mapConfidenceLevel(confidence: number): "high" | "medium" | "low" {
-  if (confidence >= 0.8) return "high";
-  if (confidence >= 0.6) return "medium";
-  return "low";
-}
-
-/**
- * Generate one-liner message about calorie percentage
- */
-function generateCalorieMessage(calories: number): string {
-  const percentage = Math.round((calories / DAILY_CALORIE_TARGET) * 100);
-  return `That's ${percentage}% of a typical daily target`;
-}
-
-/**
- * Quick food scan - lightweight single-stage analysis
- * Returns simplified results: food name, confidence, estimated calories, one-liner
- *
- * Uses only Stage 1 (perception) for speed.
- * Does NOT persist to Firestore.
- */
-export async function quickAnalyzeFood(imageBase64: string): Promise<{
-  foodName: string;
-  confidence: "high" | "medium" | "low";
-  calories: number;
-  message: string;
-}> {
-  const startTime = Date.now();
-  const apiKey = openaiApiKey.value();
-
-  if (!apiKey) {
-    throw errors.aiConfigError();
-  }
-
-  const openai = new OpenAI({ apiKey });
-  const { hash: imageHash } = computeImageHash(imageBase64);
-
-  logger.info("Starting quick food scan", { imageHash });
-
-  // Run Stage 1 only (perception)
-  const perception = await runVisionPerception(openai, imageBase64);
-
-  // Aggregate items if multiple detected
-  const items = perception.parsed.items;
-  const totalWeight = items.reduce((sum, i) => sum + i.estimatedWeight_g, 0);
-  const avgConfidence = items.reduce((sum, i) => sum + i.confidence, 0) / items.length;
-
-  // Generate food name
-  const foodName = items.length === 1 ?
-    items[0].foodName :
-    items.map((i) => i.foodName).join(" + ");
-
-  // Rough calorie estimate based on weight
-  const calories = Math.round(totalWeight * AVG_KCAL_PER_GRAM);
-
-  const durationMs = Date.now() - startTime;
-
-  logger.info("Quick scan complete", {
-    foodName,
-    calories,
-    confidence: mapConfidenceLevel(avgConfidence),
-    durationMs,
-  });
-
-  return {
-    foodName,
-    confidence: mapConfidenceLevel(avgConfidence),
-    calories,
-    message: generateCalorieMessage(calories),
-  };
-}
-</file>
-
-<file path="functions/src/index.ts">
-import { onRequest } from "firebase-functions/v2/https";
-import { onSchedule } from "firebase-functions/v2/scheduler";
-import { setGlobalOptions } from "firebase-functions/v2";
-import { initializeApp, getApps } from "firebase-admin/app";
-import { createNudgeHandler } from "./handlers/sendDailyNudge";
-import { app } from "./api";
-import { FUNCTION_CONFIG } from "./config/constants";
-
-// Initialize Firebase Admin SDK (only if not already initialized)
-if (getApps().length === 0) {
-  initializeApp();
-}
-
-// Set global options for all functions
-setGlobalOptions({
-  region: FUNCTION_CONFIG.REGION,
-  timeoutSeconds: FUNCTION_CONFIG.TIMEOUT_SECONDS,
-});
-
-/**
- * Consolidated API Endpoint
- *
- * Single Express app serving all HTTP routes:
- * - POST /register-device  (public)
- * - POST /analyze-food     (auth)
- * - POST /quick-scan       (auth)
- * - POST /backup           (auth)
- * - POST /restore          (auth)
- * - GET  /backup-status    (auth)
- * - GET  /credits          (auth)
- * - GET  /user/me          (auth)
- * - GET  /health           (public)
- *
- * invoker: 'public' is safe because all protected routes
- * enforce Firebase Auth via verifyAuth middleware.
- */
-export const api = onRequest(
-  {
-    memory: FUNCTION_CONFIG.ANALYSIS_MEMORY, // 512MiB for vision workload
-    timeoutSeconds: 60,
-    invoker: "public",
-  },
-  app,
-);
-
-// =============================================================================
-// Scheduled Push Notifications (IST times)
-// =============================================================================
-
-const SCHEDULE_CONFIG = {
-  timeZone: "Asia/Kolkata",
-  memory: FUNCTION_CONFIG.MEMORY,
-} as const;
-
-/**
- * Weight Reminder - 7:30 AM IST
- * Opens: platewise://entry
- */
-export const weightReminder = onSchedule(
-  { schedule: "30 7 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("WEIGHT_REMINDER"),
-);
-
-/**
- * Breakfast Reminder - 8:30 AM IST
- * Opens: platewise://food/capture
- */
-export const breakfastReminder = onSchedule(
-  { schedule: "30 8 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("BREAKFAST"),
-);
-
-/**
- * Lunch Reminder - 1:00 PM IST
- * Opens: platewise://food/capture
- */
-export const lunchReminder = onSchedule(
-  { schedule: "0 13 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("LUNCH"),
-);
-
-/**
- * Snacks Reminder - 5:00 PM IST
- * Opens: platewise://food/capture
- */
-export const snacksReminder = onSchedule(
-  { schedule: "0 17 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("SNACKS"),
-);
-
-/**
- * Dinner Reminder - 8:30 PM IST
- * Opens: platewise://food/capture
- */
-export const dinnerReminder = onSchedule(
-  { schedule: "30 20 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("DINNER"),
-);
-
-/**
- * Evening Check-in - 9:30 PM IST
- * Opens: platewise://dashboard
- */
-export const eveningCheckin = onSchedule(
-  { schedule: "30 21 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("EVENING_CHECKIN"),
-);
 </file>
 
 </files>
