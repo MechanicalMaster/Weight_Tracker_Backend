@@ -7,6 +7,11 @@ import { getCreditsHandler, getUserProfile } from "./handlers/credits";
 import { registerDevice } from "./handlers/registerDevice";
 import { quickScan } from "./handlers/quickScan";
 import { logEvent } from "./handlers/events";
+import {
+  createWorkflow,
+  resolveWorkflow,
+  completeWorkflow,
+} from "./handlers/workflow";
 
 const app = express();
 
@@ -23,7 +28,7 @@ app.use(latencyLogger);
 /**
  * Route Map (v1 - stable)
  * -----------------------
- * POST /register-device  - Device registration (no auth)
+ * POST /register-device  - Device registration (auth required)
  * POST /analyze-food     - Food image analysis (auth required)
  * POST /quick-scan       - Quick food scan (auth required)
  * POST /events           - Event tracking (auth required)
@@ -32,6 +37,12 @@ app.use(latencyLogger);
  * GET  /backup-status    - Backup metadata (auth required)
  * GET  /credits          - Credit balance (auth required)
  * GET  /user/me          - User profile (auth required)
+ *
+ * Workflow Routes (deferred deep linking)
+ * ---------------------------------------
+ * POST /workflows        - Create workflow (auth required)
+ * GET  /workflows/:id    - Resolve workflow (public)
+ * POST /workflows/:id/complete - Complete workflow (public)
  *
  * Route paths are considered stable for v1 and will not change
  * without version bump.
@@ -49,6 +60,11 @@ app.get("/backup-status", getBackupStatus);
 app.get("/credits", getCreditsHandler);
 app.get("/user/me", getUserProfile);
 app.post("/events", logEvent);
+
+// Workflow routes (deferred deep linking)
+app.post("/workflows", createWorkflow);
+app.get("/workflows/:id", resolveWorkflow);
+app.post("/workflows/:id/complete", completeWorkflow);
 
 // 404 handler
 app.use((_req: Request, res: Response) => {

@@ -20,6 +20,7 @@
    - [Restore](#6-restore)
    - [Backup Status](#7-backup-status)
    - [Device Registration](#8-device-registration)
+   - [Workflows (Deferred Deep Links)](#10-workflows-deferred-deep-links)
 5. [Error Codes](#error-codes)
 6. [Rate Limiting & Credits](#rate-limiting--credits)
 7. [Internal Architecture](#internal-architecture-for-advanced-integrators)
@@ -96,6 +97,9 @@ https://api-<deployment-hash>-uc.a.run.app
 | GET | `/backup-status` | Yes | Backup metadata |
 | GET | `/credits` | Yes | Credit balance |
 | GET | `/user/me` | Yes | User profile |
+| POST | `/workflows` | Yes | Create workflow (deferred deep link) |
+| GET | `/workflows/:id` | No | Resolve workflow |
+| POST | `/workflows/:id/complete` | No | Complete workflow |
 
 > Route paths are stable for v2.x and will not change without a major version bump.
 
@@ -1158,6 +1162,279 @@ Recommended user-facing messages for common errors:
 | `IMAGE_TOO_BLURRY` | "This photo is too blurry. Hold your phone steady and try again." |
 | `INSUFFICIENT_CREDITS` | "You've used all your free analyses. Upgrade to continue tracking." |
 | `AI_SERVICE_ERROR` | "Our servers are busy. Please try again in a moment." |
+
+---
+
+## 10. Workflows (Deferred Deep Links)
+
+Server-authoritative workflow system for deferred deep linking. Enables campaigns, email links, and install referrer tracking.
+
+### TypeScript Interfaces
+
+```typescript
+// Workflow types
+type WorkflowType = "LOG_WEIGHT";
+type WorkflowStatus = "ACTIVE" | "COMPLETED" | "EXPIRED";
+
+interface LogWeightPayload {
+  suggestedWeight?: number; // 20-300
+  source?: string;
+}
+
+interface CreateWorkflowRequest {
+  type: WorkflowType;
+  payload?: LogWeightPayload;
+  expiresInHours?: number; // Default: 48, Min: 1, Max: 72
+  campaignId?: string;
+  maxResolves?: number;
+}
+
+interface CreateWorkflowResponse {
+  success: true;
+  workflowId: string;
+  deepLinkUrl: string;
+}
+
+interface ResolveWorkflowResponse {
+  success: true;
+  type: WorkflowType;
+  status: WorkflowStatus;
+  payload: LogWeightPayload;
+  expiresAt: string; // ISO 8601
+}
+
+interface CompleteWorkflowResponse {
+  success: true;
+  status: "COMPLETED";
+}
+```
+
+### Create Workflow
+
+> **Auth Required:** Yes  
+> **Method:** `POST`
+
+```http
+POST /workflows
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "type": "LOG_WEIGHT",
+  "payload": { "suggestedWeight": 72.5, "source": "email_campaign" },
+  "expiresInHours": 48,
+  "campaignId": "JAN_NUDGE"
+}
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "workflowId": "WF_01HRX...",
+  "deepLinkUrl": "https://platewise.app/wf/WF_01HRX..."
+}
+```
+
+### Resolve Workflow
+
+> **Auth Required:** No (public)  
+> **Method:** `GET`
+
+```http
+GET /workflows/WF_01HRX...
+```
+
+**Response (ACTIVE):**
+
+```json
+{
+  "success": true,
+  "type": "LOG_WEIGHT",
+  "status": "ACTIVE",
+  "payload": { "suggestedWeight": 72.5 },
+  "expiresAt": "2026-02-01T00:00:00.000Z"
+}
+```
+
+**Response (EXPIRED):**
+
+```json
+{
+  "success": true,
+  "type": "LOG_WEIGHT",
+  "status": "EXPIRED",
+  "payload": { "suggestedWeight": 72.5 },
+  "expiresAt": "2026-01-30T00:00:00.000Z"
+}
+```
+
+### Complete Workflow
+
+> **Auth Required:** No (public)  
+> **Method:** `POST`
+
+```http
+POST /workflows/WF_01HRX.../complete
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "status": "COMPLETED"
+}
+```
+
+> [!NOTE]
+> Completion is **idempotent** — calling on already-completed workflows returns success.
+
+### Error Codes
+
+| Code | HTTP | Description |
+|------|------|-------------|
+| `INVALID_WORKFLOW_ID` | 400 | Malformed workflow ID format |
+| `INVALID_WORKFLOW_TYPE` | 400 | Unknown workflow type |
+| `INVALID_TTL` | 400 | TTL outside 1-72 hour range |
+| `INVALID_PAYLOAD` | 400 | Payload validation failed |
+| `WORKFLOW_NOT_FOUND` | 404 | Workflow does not exist |
+| `WORKFLOW_EXPIRED` | 409 | Cannot complete expired workflow |
+
+---
+
+## Frontend Integration: Vercel Route Handler
+
+Create `/wf/[workflowId]/route.ts` in your Next.js app:
+
+```typescript
+// app/wf/[workflowId]/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const PLAY_STORE_URL = "https://play.google.com/store/apps/details";
+const APP_STORE_URL = "https://apps.apple.com/app/idYOUR_APP_ID";
+const PACKAGE_NAME = "com.yourapp.package";
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { workflowId: string } }
+) {
+  const { workflowId } = params;
+  
+  // Validate workflow ID format (prevent injection)
+  if (!/^WF_[0-9A-HJKMNP-TV-Z]{26}$/.test(workflowId)) {
+    return NextResponse.redirect(new URL("/", request.url));
+  }
+  
+  const userAgent = request.headers.get("user-agent") || "";
+  
+  // Detect platform
+  const isAndroid = /android/i.test(userAgent);
+  const isIOS = /iphone|ipad|ipod/i.test(userAgent);
+  
+  if (isAndroid) {
+    // Redirect to Play Store with install referrer
+    const referrer = encodeURIComponent(`workflow_id=${workflowId}`);
+    const playUrl = `${PLAY_STORE_URL}?id=${PACKAGE_NAME}&referrer=${referrer}`;
+    return NextResponse.redirect(playUrl);
+  }
+  
+  if (isIOS) {
+    // Redirect to App Store (no native referrer support)
+    return NextResponse.redirect(APP_STORE_URL);
+  }
+  
+  // Desktop: Show fallback page with QR code
+  return NextResponse.redirect(new URL(`/download?wf=${workflowId}`, request.url));
+}
+```
+
+---
+
+## Frontend Integration: Android Install Referrer
+
+After app install, extract workflow ID from Play Store referrer:
+
+```kotlin
+// Android - Using Play Install Referrer SDK
+// Add dependency: com.android.installreferrer:installreferrer:2.2
+
+class InstallReferrerHelper(private val context: Context) {
+    private lateinit var referrerClient: InstallReferrerClient
+
+    fun getWorkflowId(callback: (String?) -> Unit) {
+        referrerClient = InstallReferrerClient.newBuilder(context).build()
+        
+        referrerClient.startConnection(object : InstallReferrerStateListener {
+            override fun onInstallReferrerSetupFinished(responseCode: Int) {
+                if (responseCode == InstallReferrerClient.OK) {
+                    try {
+                        val referrer = referrerClient.installReferrer.installReferrer
+                        val workflowId = extractWorkflowId(referrer)
+                        callback(workflowId)
+                    } catch (e: Exception) {
+                        callback(null)
+                    }
+                    referrerClient.endConnection()
+                }
+            }
+            
+            override fun onInstallReferrerServiceDisconnected() {
+                callback(null)
+            }
+        })
+    }
+    
+    private fun extractWorkflowId(referrer: String): String? {
+        // Parse: workflow_id=WF_01HRX...
+        val regex = "workflow_id=(WF_[0-9A-HJKMNP-TV-Z]{26})".toRegex()
+        return regex.find(referrer)?.groupValues?.get(1)
+    }
+}
+
+// Usage on first app launch:
+InstallReferrerHelper(context).getWorkflowId { workflowId ->
+    if (workflowId != null) {
+        // Call backend: GET /workflows/{workflowId}
+        resolveWorkflow(workflowId) { response ->
+            when (response.status) {
+                "ACTIVE" -> navigateToWeightEntry(response.payload.suggestedWeight)
+                "COMPLETED" -> navigateToTrends()
+                "EXPIRED" -> navigateToHome()
+            }
+        }
+    }
+}
+```
+
+---
+
+## Workflow Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Email/SMS
+    participant Vercel
+    participant PlayStore
+    participant App
+    participant Backend
+
+    Email/SMS->>User: Click link (platewise.app/wf/WF_123)
+    User->>Vercel: GET /wf/WF_123
+    Vercel->>PlayStore: Redirect with referrer
+    PlayStore->>User: Install app
+    User->>App: Launch app
+    App->>App: Read install referrer
+    App->>Backend: GET /workflows/WF_123
+    Backend->>App: {status: ACTIVE, payload: {...}}
+    App->>User: Navigate to weight entry
+    App->>Backend: POST /workflows/WF_123/complete
+```
+
+> [!IMPORTANT]
+> **Backend does NOT validate install source.** Install attribution is a frontend-only concern. Resolution is allowed from any source — this is by design.
 
 ---
 
