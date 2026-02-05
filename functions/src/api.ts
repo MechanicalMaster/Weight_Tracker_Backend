@@ -7,6 +7,7 @@ import { getCreditsHandler, getUserProfile } from "./handlers/credits";
 import { registerDevice } from "./handlers/registerDevice";
 import { quickScan } from "./handlers/quickScan";
 import { logEvent } from "./handlers/events";
+import { updateNotificationPreferences } from "./handlers/notificationPreferences";
 import {
   createWorkflow,
   resolveWorkflow,
@@ -37,6 +38,7 @@ app.use(latencyLogger);
  * GET  /backup-status    - Backup metadata (auth required)
  * GET  /credits          - Credit balance (auth required)
  * GET  /user/me          - User profile (auth required)
+ * PATCH /users/notification-preferences - Push prefs (auth required)
  *
  * Workflow Routes (deferred deep linking)
  * ---------------------------------------
@@ -60,6 +62,7 @@ app.get("/backup-status", getBackupStatus);
 app.get("/credits", getCreditsHandler);
 app.get("/user/me", getUserProfile);
 app.post("/events", logEvent);
+app.patch("/users/notification-preferences", updateNotificationPreferences);
 
 // Workflow routes (deferred deep linking)
 app.post("/workflows", createWorkflow);

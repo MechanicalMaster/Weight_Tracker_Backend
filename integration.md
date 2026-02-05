@@ -20,7 +20,9 @@
    - [Restore](#6-restore)
    - [Backup Status](#7-backup-status)
    - [Device Registration](#8-device-registration)
-   - [Workflows (Deferred Deep Links)](#10-workflows-deferred-deep-links)
+   - [Notification Preferences](#9-notification-preferences)
+   - [Event Tracking](#10-event-tracking)
+   - [Workflows (Deferred Deep Links)](#11-workflows-deferred-deep-links)
 5. [Error Codes](#error-codes)
 6. [Rate Limiting & Credits](#rate-limiting--credits)
 7. [Internal Architecture](#internal-architecture-for-advanced-integrators)
@@ -97,6 +99,7 @@ https://api-<deployment-hash>-uc.a.run.app
 | GET | `/backup-status` | Yes | Backup metadata |
 | GET | `/credits` | Yes | Credit balance |
 | GET | `/user/me` | Yes | User profile |
+| PATCH | `/users/notification-preferences` | Yes | Push notification preferences |
 | POST | `/workflows` | Yes | Create workflow (deferred deep link) |
 | GET | `/workflows/:id` | No | Resolve workflow |
 | POST | `/workflows/:id/complete` | No | Complete workflow |
@@ -229,6 +232,23 @@ interface IntentClosedMetadata {
   outcome: 'completed' | 'abandoned' | 'expired';
   actual_duration: number;   // minutes
   expected_duration: number; // minutes
+}
+
+// Notification Preferences
+type ValidPushMinute = 0 | 10 | 20 | 30 | 40 | 50;
+type NotificationType = 'weight' | 'breakfast' | 'lunch' | 'dinner' | 'snacks';
+
+interface NotificationPreferencesRequest {
+  type: NotificationType;
+  enabled: boolean;
+  hour?: number;           // 0-23 (local time)
+  minute?: ValidPushMinute;
+  timezone?: string;       // IANA timezone
+}
+
+interface NotificationPreferencesResponse {
+  success: boolean;
+  message: string;
 }
 ```
 
@@ -780,7 +800,134 @@ const registerDevice = async (data: {
 
 ---
 
-### 9. Event Tracking
+### 9. Notification Preferences
+
+Updates push notification preferences for a specific notification type.
+
+> **Auth Required:** Yes  
+> **Method:** `PATCH`
+
+```http
+PATCH /users/notification-preferences
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+#### Request Body
+
+```json
+{
+  "type": "weight",
+  "enabled": true,
+  "hour": 7,
+  "minute": 30,
+  "timezone": "Asia/Kolkata"
+}
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `type` | enum | **Required.** One of: `"weight"`, `"breakfast"`, `"lunch"`, `"dinner"`, `"snacks"` |
+| `enabled` | boolean | **Required.** Enable/disable this specific notification type |
+| `hour` | integer | Optional. 0-23 (local time) |
+| `minute` | integer | Optional. Must be one of: 0, 10, 20, 30, 40, 50 |
+| `timezone` | string | Optional. IANA timezone (e.g., `"Asia/Kolkata"`) |
+
+#### Validation Rules
+
+1. **Type Required:** Must specify which notification type to update.
+2. **Time Consistency:**
+   - If providing custom time, **both** `hour` and `minute` must be provided.
+   - If `enabled = true` and time is omitted, the system keeps the existing time (or uses default).
+3. **Minutes:** Must be in 10-minute increments.
+
+#### Response
+
+```json
+{
+  "success": true,
+  "message": "weight notification preference updated"
+}
+```
+
+#### Code Example
+
+```typescript
+type NotificationType = 'weight' | 'breakfast' | 'lunch' | 'dinner' | 'snacks';
+
+const updateNotificationPref = async (
+  type: NotificationType,
+  enabled: boolean,
+  time?: { hour: number; minute: number },
+  timezone?: string
+) => {
+  const payload: any = { type, enabled };
+  
+  if (time) {
+    payload.hour = time.hour;
+    payload.minute = time.minute;
+  }
+  
+  if (timezone) {
+    payload.timezone = timezone;
+  }
+
+  const res = await fetch(
+    `${API_BASE}/users/notification-preferences`,
+    {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${await getIdToken()}`
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  return res.json();
+};
+
+// Example: Enable Weight Reminder at 7:30 AM
+await updateNotificationPref('weight', true, { hour: 7, minute: 30 });
+
+// Example: Disable Dinner Reminder
+await updateNotificationPref('dinner', false);
+```
+
+#### Frontend Integration Guide
+
+**1. Settings Page UI:**
+Each notification type should have its own control block:
+
+- **Weight Reminder** `[Toggle]` `[7:30 AM]`
+- **Breakfast** `[Toggle]` `[8:30 AM]`
+- ...etc
+
+**2. State Management:**
+Load the user profile (`GET /user/me`) to populate initial state. The profile now includes:
+
+```json
+"notificationPrefs": {
+  "weight": { "enabled": true, "hour": 7, "minute": 30 },
+  "breakfast": { "enabled": true, "hour": 8, "minute": 30 },
+  ...
+}
+```
+
+**3. Defaults:**
+If a user hasn't configured a type, use these system defaults:
+
+| Type | Default Time |
+|------|--------------|
+| `weight` | 07:30 |
+| `breakfast` | 08:30 |
+| `lunch` | 13:00 |
+| `snacks` | 17:00 |
+| `dinner` | 20:30 |
+
+
+---
+
+### 10. Event Tracking
 
 Tracks user behavioral events with idempotent writes and automatic streak computation.
 

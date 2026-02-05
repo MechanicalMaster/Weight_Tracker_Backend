@@ -56,3 +56,19 @@ export const BACKUP_CONFIG = {
   BACKUP_FILENAME: "current.gz",
 } as const;
 
+export const NOTIFICATION_CONFIG = {
+  DEFAULT_TIMEZONE: "Asia/Kolkata",
+  VALID_MINUTES: [0, 10, 20, 30, 40, 50] as const,
+  TYPES: ["weight", "breakfast", "lunch", "dinner", "snacks"] as const,
+  DEFAULTS: {
+    weight: { enabled: true, hour: 7, minute: 30 },
+    breakfast: { enabled: true, hour: 8, minute: 30 },
+    lunch: { enabled: true, hour: 13, minute: 0 },
+    snacks: { enabled: true, hour: 17, minute: 0 },
+    dinner: { enabled: true, hour: 20, minute: 30 },
+  },
+} as const;
+
+export type NotificationType = (typeof NOTIFICATION_CONFIG.TYPES)[number];
+export type ValidMinute = (typeof NOTIFICATION_CONFIG.VALID_MINUTES)[number];
+

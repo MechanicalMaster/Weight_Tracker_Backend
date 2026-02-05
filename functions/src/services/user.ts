@@ -53,6 +53,15 @@ export interface PersonalizationContext {
 }
 
 /**
+ * Single notification type preference
+ */
+export interface NotificationPref {
+  enabled: boolean;
+  hour: number; // 0-23 (user's local time)
+  minute: number; // 0,10,20,30,40,50
+}
+
+/**
  * User document structure
  */
 export interface UserDocument {
@@ -61,6 +70,23 @@ export interface UserDocument {
   totalUsed: number;
   displayName?: string;
   timezone?: string;
+
+  // Per-type notification preferences
+  notificationPrefs?: {
+    weight?: NotificationPref;
+    breakfast?: NotificationPref;
+    lunch?: NotificationPref;
+    dinner?: NotificationPref;
+    snacks?: NotificationPref;
+  };
+
+  // Unified scheduler: single next notification (the optimization)
+  nextNotificationUTC?: Timestamp;
+  nextNotificationTypes?: string[]; // Types sharing same time
+
+  // Window-based idempotency (e.g., "2026-02-05T07:30")
+  lastNotificationWindow?: string;
+
   createdAt: Timestamp;
   lastActiveAt: Timestamp;
   updatedAt?: Timestamp;
@@ -321,3 +347,330 @@ export async function resolveContextBatch(
 
   return contextMap;
 }
+
+// ============================================================================
+// UNIFIED NOTIFICATION SCHEDULING ENGINE
+// ============================================================================
+
+import {
+  NOTIFICATION_CONFIG,
+  NotificationType,
+} from "../config/constants";
+
+/**
+ * Converts local time to next UTC timestamp.
+ * Finds the next occurrence of hour:minute in the given timezone.
+ */
+export function localTimeToNextUTC(
+  hour: number,
+  minute: number,
+  timezone: string,
+): Date {
+  const now = new Date();
+
+  // Get current time in target timezone
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const getPart = (type: string): number =>
+    parseInt(parts.find((p) => p.type === type)?.value || "0", 10);
+
+  const localHour = getPart("hour");
+  const localMinute = getPart("minute");
+
+  // Calculate timezone offset
+  const testDate = new Date();
+  const utcHour = testDate.getUTCHours();
+  const tzFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    hour: "2-digit",
+    hour12: false,
+  });
+  const tzHour = parseInt(tzFormatter.format(testDate), 10);
+  const offsetHours = tzHour - utcHour;
+
+  // Target UTC hour = local hour - offset
+  let targetUTCHour = hour - offsetHours;
+  if (targetUTCHour < 0) targetUTCHour += 24;
+  if (targetUTCHour >= 24) targetUTCHour -= 24;
+
+  // Build target date
+  const targetDate = new Date();
+  targetDate.setUTCHours(targetUTCHour, minute, 0, 0);
+
+  // If this time has passed today, move to tomorrow
+  const hasPassed =
+    localHour > hour || (localHour === hour && localMinute >= minute);
+  if (hasPassed) {
+    targetDate.setUTCDate(targetDate.getUTCDate() + 1);
+  }
+
+  return targetDate;
+}
+
+/**
+ * Computes the next notification across all enabled types.
+ * Returns the minimum time and all types sharing that time.
+ */
+export function computeNextNotification(
+  prefs: UserDocument["notificationPrefs"],
+  timezone: string,
+): { nextUTC: Date | null; types: NotificationType[] } {
+  if (!prefs) {
+    return { nextUTC: null, types: [] };
+  }
+
+  const candidates: Array<{ type: NotificationType; nextUTC: Date }> = [];
+
+  for (const type of NOTIFICATION_CONFIG.TYPES) {
+    const pref = prefs[type];
+    if (!pref?.enabled) continue;
+
+    const nextUTC = localTimeToNextUTC(pref.hour, pref.minute, timezone);
+    candidates.push({ type, nextUTC });
+  }
+
+  if (candidates.length === 0) {
+    return { nextUTC: null, types: [] };
+  }
+
+  // Find minimum time
+  const minTime = Math.min(...candidates.map((c) => c.nextUTC.getTime()));
+  const types = candidates
+    .filter((c) => c.nextUTC.getTime() === minTime)
+    .map((c) => c.type);
+
+  return { nextUTC: new Date(minTime), types };
+}
+
+/**
+ * Floor a date to the start of its 10-minute window.
+ * Returns string like "2026-02-05T07:30"
+ */
+export function getWindowKey(date: Date): string {
+  const d = new Date(date);
+  d.setUTCMinutes(Math.floor(d.getUTCMinutes() / 10) * 10, 0, 0);
+  return d.toISOString().slice(0, 16);
+}
+
+/**
+ * Input for updating a single notification type preference.
+ */
+export interface NotificationPrefInput {
+  type: NotificationType;
+  enabled: boolean;
+  hour?: number;
+  minute?: number;
+}
+
+/**
+ * Updates a single notification type preference.
+ * Immediately recomputes nextNotificationUTC.
+ */
+export async function updateNotificationPref(
+  uid: string,
+  input: NotificationPrefInput,
+  userTimezone?: string,
+): Promise<void> {
+  const userRef = db.collection("users").doc(uid);
+  const now = Timestamp.now();
+
+  // Get existing user data
+  const userDoc = await userRef.get();
+  const userData = userDoc.exists ? (userDoc.data() as UserDocument) : null;
+
+  const timezone =
+    userTimezone ||
+    userData?.timezone ||
+    NOTIFICATION_CONFIG.DEFAULT_TIMEZONE;
+
+  // Build updated prefs
+  const existingPrefs = userData?.notificationPrefs || {};
+
+  // Get defaults for this type if not provided
+  const defaults = NOTIFICATION_CONFIG.DEFAULTS[input.type];
+  const newPref: NotificationPref = {
+    enabled: input.enabled,
+    hour: input.hour ?? defaults.hour,
+    minute: input.minute ?? defaults.minute,
+  };
+
+  const updatedPrefs = {
+    ...existingPrefs,
+    [input.type]: newPref,
+  };
+
+  // Compute next notification
+  const { nextUTC, types } = computeNextNotification(updatedPrefs, timezone);
+
+  const updateData: Record<string, unknown> = {
+    [`notificationPrefs.${input.type}`]: newPref,
+    updatedAt: now,
+    lastActiveAt: now,
+  };
+
+  if (userTimezone) {
+    updateData.timezone = userTimezone;
+  }
+
+  if (nextUTC) {
+    updateData.nextNotificationUTC = Timestamp.fromDate(nextUTC);
+    updateData.nextNotificationTypes = types;
+  } else {
+    updateData.nextNotificationUTC = FieldValue.delete();
+    updateData.nextNotificationTypes = FieldValue.delete();
+  }
+
+  await userRef.update(updateData);
+  logger.info(`Updated notification pref for user ${uid}`, {
+    type: input.type,
+    enabled: input.enabled,
+  });
+}
+
+/**
+ * User eligible for notification.
+ */
+export interface EligibleUser {
+  uid: string;
+  timezone: string;
+  notificationTypes: NotificationType[];
+  notificationPrefs: UserDocument["notificationPrefs"];
+  lastNotificationWindow?: string;
+}
+
+/**
+ * Gets users eligible for notification at the current time.
+ * Uses single indexed query: nextNotificationUTC <= now
+ */
+export async function getEligibleUsers(): Promise<EligibleUser[]> {
+  const now = Timestamp.now();
+
+  try {
+    const snapshot = await db
+      .collection("users")
+      .where("nextNotificationUTC", "<=", now)
+      .get();
+
+    const eligibleUsers: EligibleUser[] = [];
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data() as UserDocument;
+      eligibleUsers.push({
+        uid: doc.id,
+        timezone: data.timezone || NOTIFICATION_CONFIG.DEFAULT_TIMEZONE,
+        notificationTypes: (data.nextNotificationTypes || []) as NotificationType[],
+        notificationPrefs: data.notificationPrefs,
+        lastNotificationWindow: data.lastNotificationWindow,
+      });
+    }
+
+    logger.info(`Found ${eligibleUsers.length} eligible users for notification`);
+    return eligibleUsers;
+  } catch (error) {
+    logger.error("Failed to query eligible users", { error });
+    return [];
+  }
+}
+
+/**
+ * Schedules next notification for a user.
+ * Atomic update: sets nextNotificationUTC, nextNotificationTypes, lastNotificationWindow.
+ * Call this BEFORE sending to ensure idempotency.
+ */
+export async function scheduleNextNotification(
+  uid: string,
+  windowKey: string,
+): Promise<void> {
+  const userRef = db.collection("users").doc(uid);
+  const now = Timestamp.now();
+
+  try {
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) {
+      logger.warn(`Cannot schedule next: user ${uid} not found`);
+      return;
+    }
+
+    const userData = userDoc.data() as UserDocument;
+    const timezone = userData.timezone || NOTIFICATION_CONFIG.DEFAULT_TIMEZONE;
+
+    // Compute next notification (excluding types just sent)
+    const { nextUTC, types } = computeNextNotification(
+      userData.notificationPrefs,
+      timezone,
+    );
+
+    const updateData: Record<string, unknown> = {
+      lastNotificationWindow: windowKey,
+      lastActiveAt: now,
+    };
+
+    if (nextUTC) {
+      // Ensure next is in future (at least 23 hours from now to prevent same-day)
+      const minNextTime = new Date(Date.now() + 23 * 60 * 60 * 1000);
+      if (nextUTC < minNextTime) {
+        nextUTC.setUTCDate(nextUTC.getUTCDate() + 1);
+      }
+      updateData.nextNotificationUTC = Timestamp.fromDate(nextUTC);
+      updateData.nextNotificationTypes = types;
+    } else {
+      updateData.nextNotificationUTC = FieldValue.delete();
+      updateData.nextNotificationTypes = FieldValue.delete();
+    }
+
+    await userRef.update(updateData);
+    logger.info(`Scheduled next notification for user ${uid}`, {
+      nextTypes: types,
+      nextTime: nextUTC?.toISOString(),
+    });
+  } catch (error) {
+    logger.error(`Failed to schedule next for user ${uid}`, { error });
+  }
+}
+
+/**
+ * Initializes default notification preferences for a user.
+ * Used during migration or new user setup.
+ */
+export async function initializeNotificationPrefs(uid: string): Promise<void> {
+  const userRef = db.collection("users").doc(uid);
+  const now = Timestamp.now();
+
+  const userDoc = await userRef.get();
+  const userData = userDoc.exists ? (userDoc.data() as UserDocument) : null;
+
+  // Skip if already has prefs
+  if (userData?.notificationPrefs) {
+    return;
+  }
+
+  const timezone = userData?.timezone || NOTIFICATION_CONFIG.DEFAULT_TIMEZONE;
+  const defaultPrefs = { ...NOTIFICATION_CONFIG.DEFAULTS };
+
+  // Compute next notification
+  const { nextUTC, types } = computeNextNotification(defaultPrefs, timezone);
+
+  const updateData: Record<string, unknown> = {
+    notificationPrefs: defaultPrefs,
+    updatedAt: now,
+  };
+
+  if (nextUTC) {
+    updateData.nextNotificationUTC = Timestamp.fromDate(nextUTC);
+    updateData.nextNotificationTypes = types;
+  }
+
+  await userRef.update(updateData);
+  logger.info(`Initialized notification prefs for user ${uid}`);
+}
+
+

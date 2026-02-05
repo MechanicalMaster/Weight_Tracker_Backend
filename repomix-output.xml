@@ -47,6 +47,7 @@ functions/
   src/
     config/
       constants.ts
+      templates.ts
     handlers/
       analyzeFoodImage.ts
       backup.ts
@@ -55,6 +56,7 @@ functions/
       quickScan.ts
       registerDevice.ts
       sendDailyNudge.ts
+      workflow.ts
     middleware/
       auth.ts
       latency.ts
@@ -65,10 +67,12 @@ functions/
       firestore.ts
       user.ts
       vision.ts
+      workflow.ts
     types/
       behavioral.ts
       index.ts
       visionSchemas.ts
+      workflow.ts
     utils/
       errors.ts
       validation.ts
@@ -80,9 +84,11 @@ functions/
 .firebaserc
 .gitignore
 ai_strategy.md
+deferred_deeplink.md
 firebase.json
 firestore.indexes.json
 firestore.rules
+future_scope.md
 implementation_plan.md
 integration.md
 README.md
@@ -92,142 +98,6 @@ storage.rules
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="ai_strategy.md">
-# AI Observability & Evaluation Strategy
-
-## 1. Observability: "What is happening right now?"
-
-Observability goes beyond simple logging. It answers questions like *"Why did that request cost $0.05?"* or *"Why is the model hallucinating hot dogs as carrots?"*.
-
-### A. The "Black Box" Recorder
-We are currently logging inputs (Image Hash) and outputs (Parsed JSON). We need to enrich this.
-
-**Action Items:**
-1.  **Capture Token Usage**: Extract `response.usage` (prompt_tokens, completion_tokens) from OpenAI responses.
-    *   *Why:* To calculate exact COGS (Cost of Goods Sold) per image analysis.
-2.  **Trace ID Propagation**: Ensure a single `traceId` follows the request from the Client -> API -> Stage 1 -> Stage 2 -> Firestore.
-3.  **Model Configuration Snapshot**: Store the exact params used (temperature, max_tokens, prompt_version) alongside the result. You are already doing this with `promptVersion`—excellent.
-
-### B. The Feedback Loop (The "Golden Signal")
-The most valuable signal is **User Correction**.
-If the AI predicts "150g Chicken Breast" and the user changes it to "200g Steak", that is a high-quality training example.
-
-**Implementation Approach:**
-1.  **Link Analysis to Entry**: When the user saves a meal, pass the `FoodAnalysisRecord.id` that generated the data.
-2.  **The "Act vs. Predict" Diff**: Trigger a background function on meal save:
-    *   **Predicted**: { food: "Chicken", calories: 200 } (from `FoodAnalysisRecord`)
-    *   **Actual**: { food: "Steak", calories: 450 } (from `MealLog`)
-    *   **Metric**: Calculate `Error %` or `Semantic Distance`.
-3.  **Flagging**: If `Error % > 50%`, flag the image for manual review (to be added to your Golden Dataset).
-
----
-
-## 2. Evaluations (Evals): "Is it getting better?"
-
-Never deploy a prompt change without running Evals. It protects you from regression (e.g., you fix "Pizza detection" but break "Salad detection").
-
-### A. The "Golden Dataset"
-You need a "Truth Set".
-
-**Structure:**
-*   Folder: `evals/dataset/`
-*   Content:
-    *   `pizza_01.jpg` -> `pizza_01.json` (Expected: "Pizza", ~300kcal)
-    *   `salad_bowl.jpg` -> `salad_bowl.json` (Expected: "Mixed Greens", ~50kcal)
-*   **Size**: Start with 20 diverse images. Aim for 50.
-
-### B. Automated Eval Pipeline (CI/CD for AI)
-Create a script (e.g., `npm run eval`) that:
-1.  Iterates through your Golden Dataset.
-2.  Runs your *current* `vision.ts` logic against each image.
-3.  **Scores the result** against the `.json` truth file.
-
-**Scoring Metrics:**
-1.  **Hit Rate (Classification)**: Did it identify the "Pizza"? (Yes/No)
-    *   *Implementation*: `string similarity` check or `LLM-as-a-Judge` ("Does 'Margherita Pie' mean 'Pizza'?").
-2.  **MAE (Mean Absolute Error) for Calories**: `Abs(Predicted - Actual)`.
-    *   *Goal*: Minimize this number across the dataset.
-
-### C. LLM-as-a-Judge
-Instead of writing complex Regex to compare "Steak" vs "Beef Steak", use a cheap LLM (gpt-4o-mini) to grade the response.
-
-**Prompt for Judge:**
-> "Ground truth is 'Grilled Chicken Salad'. Model predicted 'Chicken Caesar Salad'. On a scale of 0-1, how accurate is this? 1 = Correct, 0 = Wrong."
-
----
-
-## 3. Implementation Roadmap
-
-### Phase 1: Passive Observation (Low Effort)
-- [ ] Update `vision.ts` to log token usage and costs.
-- [ ] Add `parentAnalysisId` to your `FoodLog` schema to link saved meals back to AI predictions.
-
-### Phase 2: dataset Accumulation
-- [ ] Create a script to query Firestore for "High Correction" events (where user changed >50% of values).
-- [ ] Download these images + user's "Actual" data to form your **Golden Dataset**.
-
-### Phase 3: Automated Evals
-- [ ] Write the `evals/run.ts` script.
-- [ ] Run this script before every prompt edit.
-</file>
-
-<file path="implementation_plan.md">
-# Plan: Personalized Push Notifications
-
-## Goal
-Include the user's name in push notifications (e.g., "Good morning, Ronak! ⚖️" instead of "Good morning! ⚖️").
-
-## Current State Analysis
-1.  **Missing Data**: The `UserDocument` schema in `functions/src/services/user.ts` does **not** currently have a `displayName` field. Even if the frontend captures it, the backend isn't typing it or using it.
-2.  **Generic Sending**: `sendBatchNotifications` in `functions/src/services/fcm.ts` accepts a single static `title` and `body` string for all devices.
-3.  **Data Flow**: `sendDailyNudge.ts` fetches active devices but does *not* fetch user profiles.
-
-## Detailed Implementation Plan
-
-### 1. Database & Schema Updates
-*   **Update Interface**: Modify `UserDocument` in `functions/src/services/user.ts` to include `displayName?: string`.
-*   **Data Ingestion**: Ensure the `registerDevice` or user onboarding flow actually writes this field to Firestore.
-    *   *Note*: If this is currently handled by the client writing directly to Firestore, we just need to update the backend types. If handled via API, we need to update the request schema.
-
-### 2. Logic Refactor: `sendDailyNudge.ts`
-The nudge handler needs to become "user-aware".
-
-*   **Step A: Fetch Users**: After getting `activeDevices`, extract all unique `uid`s.
-*   **Step B: Batch Read**: Perform a batch read from the `users` collection to get profile data for these UIDs.
-    *   *Optimization*: Use `db.getAll(...userRefs)` or chunked queries to avoid hitting limits.
-*   **Step C: Map creation**: Create a lookup map: `Map<string, UserDocument>`.
-
-### 3. Service Refactor: `fcm.ts`
-The `sendBatchNotifications` function is too rigid.
-
-*   **Change Signature**: Instead of `(devices, title, body)`, it should accept a prepared list of notification objects:
-    ```typescript
-    interface NotificationPayload {
-      device: DeviceDocument;
-      title: string;
-      body: string;
-    }
-    // New signature
-    function sendBatchNotifications(payloads: NotificationPayload[])
-    ```
-*   **Logic**: Iterate through the `payloads` array. For each item, use its specific title and body.
-
-### 4. Putting it Together (Pseudo-Flow)
-1.  `sendDailyNudge` starts.
-2.  Fetches 1000 devices.
-3.  Fetches 800 users (some have multiple devices).
-4.  Loops through devices:
-    *   Finds User for Device A.
-    *   Name = `user.displayName` || "Friend".
-    *   Generates message: `Hello ${Name}!`
-    *   Adds to `payloads` array.
-5.  Calls `sendBatchNotifications(payloads)`.
-
-## Verification Strategy
-1.  **Unit Test**: Mock `sendPushNotification` and verify that when a user has a name, the mock is called with the personalized string.
-2.  **Manually**: Use a test device, register with a name, trigger the cron job, and verify the physical notification.
-</file>
 
 <file path=".github/workflows/deploy.yml">
 name: Deploy to Firebase
@@ -297,6 +167,104 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+</file>
+
+<file path="functions/src/config/templates.ts">
+import { PersonalizationContext } from "../services/user";
+
+/**
+ * Notification template structure.
+ * Templates support variable interpolation using {{variableName}} syntax.
+ */
+export interface NotificationTemplate {
+    id: string;
+    title: string;
+    body: string;
+    link: string;
+}
+
+/**
+ * Central template registry.
+ * All notification templates are defined here for consistency and easy updates.
+ */
+export const TEMPLATES = {
+  WEIGHT_REMINDER_V1: {
+    id: "weight_reminder_v1",
+    title: "Good {{timeOfDay}}, {{displayName}}! ⚖️",
+    body: "Time to log your weight.",
+    link: "platewise://entry",
+  },
+  BREAKFAST_V1: {
+    id: "breakfast_v1",
+    title: "Breakfast time, {{displayName}}! 🍳",
+    body: "Had breakfast? Snap a quick photo",
+    link: "platewise://food/capture",
+  },
+  LUNCH_V1: {
+    id: "lunch_v1",
+    title: "Lunch time, {{displayName}}! 🥗",
+    body: "Capture what you're eating",
+    link: "platewise://food/capture",
+  },
+  SNACKS_V1: {
+    id: "snacks_v1",
+    title: "Snack check, {{displayName}} 🍎",
+    body: "Snacking? Log it to stay on track",
+    link: "platewise://food/capture",
+  },
+  DINNER_V1: {
+    id: "dinner_v1",
+    title: "Dinner time, {{displayName}}! 🍽️",
+    body: "Don't forget to log your meal",
+    link: "platewise://food/capture",
+  },
+  EVENING_CHECKIN_V1: {
+    id: "evening_checkin_v1",
+    title: "Daily check-in, {{displayName}} 📊",
+    body: "How was your day? Check your progress",
+    link: "platewise://dashboard",
+  },
+} as const;
+
+export type TemplateId = keyof typeof TEMPLATES;
+
+/**
+ * Renders a template by replacing placeholders with context values.
+ *
+ * Supported placeholders:
+ * - {{displayName}} - User's display name or "Friend"
+ * - {{timeOfDay}} - "morning", "afternoon", or "evening"
+ * - {{timezone}} - User's timezone (rarely used in messages)
+ *
+ * @param template The notification template to render
+ * @param context The personalization context with values for placeholders
+ * @returns Rendered title and body
+ */
+export function renderTemplate(
+  template: NotificationTemplate,
+  context: PersonalizationContext,
+): { title: string; body: string } {
+  const replacePlaceholders = (text: string): string => {
+    return text
+      .replace(/\{\{displayName\}\}/g, context.displayName)
+      .replace(/\{\{timeOfDay\}\}/g, context.timeOfDay)
+      .replace(/\{\{timezone\}\}/g, context.timezone);
+  };
+
+  return {
+    title: replacePlaceholders(template.title),
+    body: replacePlaceholders(template.body),
+  };
+}
+
+/**
+ * Gets a template by its ID.
+ * @param templateId The template identifier
+ * @returns The template or undefined if not found
+ */
+export function getTemplate(templateId: TemplateId): NotificationTemplate {
+  return TEMPLATES[templateId];
+}
 </file>
 
 <file path="functions/src/handlers/backup.ts">
@@ -599,6 +567,154 @@ export async function logEvent(req: Request, res: Response): Promise<void> {
       success: true,
       status: result.status,
       eventId: result.eventId,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
+<file path="functions/src/handlers/workflow.ts">
+// Workflow handlers for deferred deep linking
+import { Request, Response } from "express";
+import { handleError, errors } from "../utils/errors";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+import * as workflowService from "../services/workflow";
+import { CreateWorkflowRequest, WORKFLOW_TYPES } from "../types/workflow";
+
+/**
+ * POST /workflows
+ * Creates a new workflow for deferred deep linking
+ *
+ * Auth: Required
+ * Body: CreateWorkflowRequest
+ */
+export async function createWorkflow(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    // Verify authentication
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+
+    // Note: Auth verified for rate limiting; uid unused for public workflows
+    const body = req.body as CreateWorkflowRequest;
+
+    // Validate required field
+    if (!body.type) {
+      throw errors.invalidRequest("type is required");
+    }
+
+    // Validate workflow type
+    if (!WORKFLOW_TYPES.includes(body.type)) {
+      throw errors.invalidRequest(
+        `Invalid workflow type. Allowed: ${WORKFLOW_TYPES.join(", ")}`,
+      );
+    }
+
+    // Create workflow
+    const result = await workflowService.createWorkflow({
+      type: body.type,
+      payload: body.payload,
+      expiresInHours: body.expiresInHours,
+      campaignId: body.campaignId,
+      maxResolves: body.maxResolves,
+    });
+
+    res.status(200).json({
+      success: true,
+      workflowId: result.workflowId,
+      deepLinkUrl: result.deepLinkUrl,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+
+/**
+ * GET /workflows/:id
+ * Resolves a workflow by ID
+ *
+ * Auth: Not required (public workflows)
+ *
+ * Note: Backend does NOT validate install source.
+ * Install attribution is a frontend-only concern.
+ * Resolution is allowed from any source by design.
+ */
+export async function resolveWorkflow(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    const workflowId = req.params.id;
+
+    if (!workflowId) {
+      throw errors.invalidRequest("Workflow ID is required");
+    }
+
+    const result = await workflowService.resolveWorkflow(workflowId);
+
+    res.status(200).json({
+      success: true,
+      type: result.type,
+      status: result.status,
+      payload: result.payload,
+      expiresAt: result.expiresAt,
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+
+/**
+ * POST /workflows/:id/complete
+ * Marks a workflow as completed
+ *
+ * Auth: Not required (public workflows)
+ *
+ * Idempotent: Calling on already-completed workflow returns success.
+ * State guard: Returns 409 if workflow is EXPIRED.
+ */
+export async function completeWorkflow(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    const workflowId = req.params.id;
+
+    if (!workflowId) {
+      throw errors.invalidRequest("Workflow ID is required");
+    }
+
+    const result = await workflowService.completeWorkflow(workflowId);
+
+    res.status(200).json({
+      success: true,
+      status: result.status,
     });
   } catch (error) {
     handleError(error, res);
@@ -976,148 +1092,352 @@ export async function trackEventAsync(
 }
 </file>
 
-<file path="functions/src/services/user.ts">
-import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
-import { logger } from "firebase-functions/v2";
-import { errors } from "../utils/errors";
+<file path="functions/src/services/workflow.ts">
+// Workflow service for deferred deep linking
+import { db } from "./firestore";
+import { ulid } from "ulid";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import {
+  WorkflowDocument,
+  WorkflowStatus,
+  WorkflowType,
+  LogWeightPayload,
+  WORKFLOW_ID_REGEX,
+  WORKFLOW_TYPES,
+  MIN_TTL_HOURS,
+  MAX_TTL_HOURS,
+  MIN_WEIGHT,
+  MAX_WEIGHT,
+} from "../types/workflow";
+import { ApiError } from "../utils/errors";
 
-const db = getFirestore();
+// Deep link base URL (Vercel frontend)
+const DEEP_LINK_BASE_URL = process.env.DEEP_LINK_BASE_URL ||
+    "https://platewise.app";
 
-// Default free credits for new users
-const DEFAULT_FREE_CREDITS = 20;
+// Collection reference
+const workflowsCollection = db.collection("workflows");
+
+// ============================================================================
+// Structured Logging
+// ============================================================================
+
+interface WorkflowLogEvent {
+    event: string;
+    workflowId?: string;
+    providedId?: string;
+    type?: WorkflowType;
+    status?: WorkflowStatus;
+    campaignId?: string;
+    expiresAt?: string;
+    completedAt?: string;
+    resolveCount?: number;
+    currentStatus?: WorkflowStatus;
+    reason?: string;
+    timestamp: string;
+}
+
+function logWorkflowEvent(event: WorkflowLogEvent): void {
+  console.log(JSON.stringify(event));
+}
+
+// ============================================================================
+// Validation
+// ============================================================================
 
 /**
- * User document structure
+ * Validates workflow ID format (WF_{ULID})
+ * Throws 400 if malformed to prevent Firestore injection
  */
-export interface UserDocument {
-    aiCredits: number;
-    totalGranted: number;
-    totalUsed: number;
-    createdAt: Timestamp;
-    lastActiveAt: Timestamp;
+export function validateWorkflowId(id: string): void {
+  if (!WORKFLOW_ID_REGEX.test(id)) {
+    logWorkflowEvent({
+      event: "workflow_invalid_id",
+      providedId: id,
+      reason: "Malformed workflow ID format",
+      timestamp: new Date().toISOString(),
+    });
+    throw new ApiError(400, "Invalid workflow ID format", "INVALID_WORKFLOW_ID");
+  }
 }
 
 /**
- * Initialize a new user with free credits
- * Called on first authentication
+ * Validates workflow type against allowed types
  */
-export async function initializeUser(uid: string): Promise<UserDocument> {
-  const userRef = db.collection("users").doc(uid);
+export function validateWorkflowType(type: string): asserts type is WorkflowType {
+  if (!WORKFLOW_TYPES.includes(type as WorkflowType)) {
+    throw new ApiError(
+      400,
+      `Invalid workflow type. Allowed: ${WORKFLOW_TYPES.join(", ")}`,
+      "INVALID_WORKFLOW_TYPE",
+    );
+  }
+}
 
-  const existingUser = await userRef.get();
-  if (existingUser.exists) {
-    logger.info(`User ${uid} already exists, returning existing data`);
-    return existingUser.data() as UserDocument;
+/**
+ * Validates TTL is within bounds [MIN_TTL_HOURS, MAX_TTL_HOURS]
+ */
+export function validateTTL(hours: number): void {
+  if (hours < MIN_TTL_HOURS || hours > MAX_TTL_HOURS) {
+    throw new ApiError(
+      400,
+      `TTL must be between ${MIN_TTL_HOURS} and ${MAX_TTL_HOURS} hours`,
+      "INVALID_TTL",
+    );
+  }
+}
+
+/**
+ * Validates payload based on workflow type
+ */
+export function validatePayload(
+  type: WorkflowType,
+  payload: LogWeightPayload | undefined,
+): LogWeightPayload {
+  const validatedPayload: LogWeightPayload = { ...payload };
+
+  if (type === "LOG_WEIGHT") {
+    if (
+      validatedPayload.suggestedWeight !== undefined &&
+            (validatedPayload.suggestedWeight < MIN_WEIGHT ||
+                validatedPayload.suggestedWeight > MAX_WEIGHT)
+    ) {
+      throw new ApiError(
+        400,
+        `suggestedWeight must be between ${MIN_WEIGHT} and ${MAX_WEIGHT}`,
+        "INVALID_PAYLOAD",
+      );
+    }
+  }
+
+  return validatedPayload;
+}
+
+// ============================================================================
+// Service Functions
+// ============================================================================
+
+/**
+ * Generates a new workflow ID with ULID
+ */
+function generateWorkflowId(): string {
+  return `WF_${ulid()}`;
+}
+
+/**
+ * Computes the effective status considering expiry
+ * Does NOT mutate the document - expiry is computed, not persisted
+ */
+function computeStatus(workflow: WorkflowDocument): WorkflowStatus {
+  if (workflow.status === "COMPLETED") {
+    return "COMPLETED";
   }
 
   const now = Timestamp.now();
-  const userData: UserDocument = {
-    aiCredits: DEFAULT_FREE_CREDITS,
-    totalGranted: DEFAULT_FREE_CREDITS,
-    totalUsed: 0,
-    createdAt: now,
-    lastActiveAt: now,
-  };
-
-  await userRef.set(userData);
-  logger.info(`Initialized new user ${uid} with ${DEFAULT_FREE_CREDITS} credits`);
-
-  return userData;
-}
-
-/**
- * Get or create user data
- */
-export async function getOrCreateUser(uid: string): Promise<UserDocument> {
-  const userRef = db.collection("users").doc(uid);
-  const userDoc = await userRef.get();
-
-  if (!userDoc.exists) {
-    return initializeUser(uid);
+  if (workflow.expiresAt.toMillis() < now.toMillis()) {
+    return "EXPIRED";
   }
 
-  // Update last active timestamp
-  await userRef.update({ lastActiveAt: FieldValue.serverTimestamp() });
-
-  return userDoc.data() as UserDocument;
+  return "ACTIVE";
 }
 
 /**
- * Get current credit balance
+ * Creates a new workflow
  */
-export async function getCredits(uid: string): Promise<number> {
-  const user = await getOrCreateUser(uid);
-  return user.aiCredits;
+export async function createWorkflow(params: {
+    type: WorkflowType;
+    payload?: LogWeightPayload;
+    expiresInHours?: number;
+    campaignId?: string;
+    maxResolves?: number;
+}): Promise<{ workflowId: string; deepLinkUrl: string }> {
+  const {
+    type,
+    payload,
+    expiresInHours = 48,
+    campaignId,
+    maxResolves,
+  } = params;
+
+  // Validate inputs
+  validateWorkflowType(type);
+  validateTTL(expiresInHours);
+  const validatedPayload = validatePayload(type, payload);
+
+  // Generate ID and timestamps
+  const workflowId = generateWorkflowId();
+  const now = Timestamp.now();
+  const expiresAt = Timestamp.fromMillis(
+    now.toMillis() + expiresInHours * 60 * 60 * 1000,
+  );
+
+  // Create workflow document
+  // userId is null for public workflows (current implementation)
+  const workflowDoc: WorkflowDocument = {
+    id: workflowId,
+    type,
+    status: "ACTIVE",
+    payload: validatedPayload,
+    userId: null, // Public workflows for now
+    campaignId,
+    createdAt: now,
+    expiresAt,
+    maxResolves,
+    metadata: {
+      clickCount: 0,
+      resolveCount: 0,
+    },
+  };
+
+  // Store in Firestore
+  await workflowsCollection.doc(workflowId).set(workflowDoc);
+
+  // Build deep link URL
+  const deepLinkUrl = `${DEEP_LINK_BASE_URL}/wf/${workflowId}`;
+
+  // Log creation
+  logWorkflowEvent({
+    event: "workflow_created",
+    workflowId,
+    type,
+    campaignId,
+    expiresAt: expiresAt.toDate().toISOString(),
+    timestamp: new Date().toISOString(),
+  });
+
+  return { workflowId, deepLinkUrl };
 }
 
 /**
- * Deduct one credit from user balance
- * Uses transaction to prevent race conditions
- * Throws INSUFFICIENT_CREDITS if balance is 0
+ * Resolves a workflow by ID
+ * Returns computed status (EXPIRED if past TTL, without persisting)
  */
-export async function deductCredit(uid: string): Promise<number> {
-  const userRef = db.collection("users").doc(uid);
+export async function resolveWorkflow(workflowId: string): Promise<{
+    type: WorkflowType;
+    status: WorkflowStatus;
+    payload: LogWeightPayload;
+    expiresAt: string;
+}> {
+  // Validate ID format
+  validateWorkflowId(workflowId);
 
-  const newBalance = await db.runTransaction(async (transaction) => {
-    const userDoc = await transaction.get(userRef);
+  // Fetch document
+  const docRef = workflowsCollection.doc(workflowId);
+  const docSnap = await docRef.get();
 
-    if (!userDoc.exists) {
-      // Initialize user first
-      const now = Timestamp.now();
-      const userData: UserDocument = {
-        aiCredits: DEFAULT_FREE_CREDITS,
-        totalGranted: DEFAULT_FREE_CREDITS,
-        totalUsed: 0,
-        createdAt: now,
-        lastActiveAt: now,
-      };
-      transaction.set(userRef, userData);
-      // Deduct one credit
-      transaction.update(userRef, {
-        aiCredits: DEFAULT_FREE_CREDITS - 1,
-        totalUsed: 1,
-        lastActiveAt: FieldValue.serverTimestamp(),
+  if (!docSnap.exists) {
+    throw new ApiError(404, "Workflow not found", "WORKFLOW_NOT_FOUND");
+  }
+
+  const workflow = docSnap.data() as WorkflowDocument;
+
+  // Compute effective status (lazy expiry - no persistence)
+  const computedStatus = computeStatus(workflow);
+
+  // Increment resolve counter atomically
+  await docRef.update({
+    "metadata.resolveCount": FieldValue.increment(1),
+    "metadata.lastResolvedAt": Timestamp.now(),
+  });
+
+  // Log based on status
+  if (computedStatus === "EXPIRED") {
+    logWorkflowEvent({
+      event: "workflow_expired_access",
+      workflowId,
+      expiresAt: workflow.expiresAt.toDate().toISOString(),
+      timestamp: new Date().toISOString(),
+    });
+  } else {
+    logWorkflowEvent({
+      event: "workflow_resolved",
+      workflowId,
+      status: computedStatus,
+      resolveCount: (workflow.metadata.resolveCount || 0) + 1,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  return {
+    type: workflow.type,
+    status: computedStatus,
+    payload: workflow.payload,
+    expiresAt: workflow.expiresAt.toDate().toISOString(),
+  };
+}
+
+/**
+ * Completes a workflow (atomic transaction with state guard)
+ *
+ * State transitions allowed:
+ * - ACTIVE → COMPLETED ✓
+ *
+ * State transitions forbidden:
+ * - COMPLETED → ACTIVE ❌
+ * - EXPIRED → ACTIVE ❌
+ * - EXPIRED → COMPLETED ❌
+ */
+export async function completeWorkflow(
+  workflowId: string,
+): Promise<{ status: "COMPLETED" }> {
+  // Validate ID format
+  validateWorkflowId(workflowId);
+
+  const docRef = workflowsCollection.doc(workflowId);
+
+  await db.runTransaction(async (transaction) => {
+    const docSnap = await transaction.get(docRef);
+
+    if (!docSnap.exists) {
+      throw new ApiError(404, "Workflow not found", "WORKFLOW_NOT_FOUND");
+    }
+
+    const workflow = docSnap.data() as WorkflowDocument;
+    const computedStatus = computeStatus(workflow);
+
+    // State guard: only ACTIVE workflows can be completed
+    // Idempotent: if already COMPLETED, return success
+    if (computedStatus === "COMPLETED") {
+      logWorkflowEvent({
+        event: "workflow_completed",
+        workflowId,
+        completedAt: workflow.completedAt?.toDate().toISOString() || "unknown",
+        timestamp: new Date().toISOString(),
       });
-      return DEFAULT_FREE_CREDITS - 1;
+      return; // Already completed, idempotent success
     }
 
-    const userData = userDoc.data() as UserDocument;
-
-    if (userData.aiCredits <= 0) {
-      throw errors.insufficientCredits();
+    // Forbidden: cannot complete expired workflows
+    if (computedStatus === "EXPIRED") {
+      logWorkflowEvent({
+        event: "workflow_illegal_transition",
+        workflowId,
+        currentStatus: "EXPIRED",
+        timestamp: new Date().toISOString(),
+      });
+      throw new ApiError(
+        409,
+        "Cannot complete expired workflow",
+        "WORKFLOW_EXPIRED",
+      );
     }
 
-    const newCredits = userData.aiCredits - 1;
-    transaction.update(userRef, {
-      aiCredits: newCredits,
-      totalUsed: FieldValue.increment(1),
-      lastActiveAt: FieldValue.serverTimestamp(),
+    // Transition to COMPLETED
+    const now = Timestamp.now();
+    transaction.update(docRef, {
+      status: "COMPLETED",
+      completedAt: now,
     });
 
-    return newCredits;
+    logWorkflowEvent({
+      event: "workflow_completed",
+      workflowId,
+      completedAt: now.toDate().toISOString(),
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  logger.info(`Deducted credit for user ${uid}, remaining: ${newBalance}`);
-  return newBalance;
-}
-
-/**
- * Add credits to user balance (for future admin/payment use)
- */
-export async function addCredits(uid: string, amount: number): Promise<number> {
-  const userRef = db.collection("users").doc(uid);
-
-  await userRef.update({
-    aiCredits: FieldValue.increment(amount),
-    totalGranted: FieldValue.increment(amount),
-    lastActiveAt: FieldValue.serverTimestamp(),
-  });
-
-  const updated = await userRef.get();
-  const credits = (updated.data() as UserDocument).aiCredits;
-
-  logger.info(`Added ${amount} credits to user ${uid}, new balance: ${credits}`);
-  return credits;
+  return { status: "COMPLETED" };
 }
 </file>
 
@@ -1273,6 +1593,85 @@ export type IntentCapturedMeta = z.infer<typeof IntentCapturedMetadata>;
 export type IntentClosedMeta = z.infer<typeof IntentClosedMetadata>;
 </file>
 
+<file path="functions/src/types/workflow.ts">
+// Workflow types for deferred deep linking
+import { Timestamp } from "firebase-admin/firestore";
+
+// Workflow ID validation regex (ULID with WF_ prefix)
+export const WORKFLOW_ID_REGEX = /^WF_[0-9A-HJKMNP-TV-Z]{26}$/;
+
+// TTL bounds
+export const MIN_TTL_HOURS = 1;
+export const MAX_TTL_HOURS = 72;
+
+// Payload weight bounds
+export const MIN_WEIGHT = 20;
+export const MAX_WEIGHT = 300;
+
+// Allowed workflow types
+export const WORKFLOW_TYPES = ["LOG_WEIGHT"] as const;
+export type WorkflowType = (typeof WORKFLOW_TYPES)[number];
+
+// Workflow status
+export type WorkflowStatus = "ACTIVE" | "COMPLETED" | "EXPIRED";
+
+// Per-type payload schemas
+export interface LogWeightPayload {
+    suggestedWeight?: number; // Validated: 20-300
+    source?: string;
+}
+
+// Workflow document stored in Firestore
+export interface WorkflowDocument {
+    id: string; // WF_{ULID}
+    type: WorkflowType;
+    status: WorkflowStatus;
+    payload: LogWeightPayload;
+    userId: string | null; // null = public workflow
+    campaignId?: string;
+    createdAt: Timestamp;
+    expiresAt: Timestamp;
+    completedAt?: Timestamp;
+    maxResolves?: number; // Optional limit for campaign protection
+    metadata: {
+        clickCount: number;
+        resolveCount: number;
+        lastResolvedAt?: Timestamp;
+    };
+}
+
+// Create workflow request
+export interface CreateWorkflowRequest {
+    type: WorkflowType;
+    payload?: LogWeightPayload;
+    expiresInHours?: number; // Default: 48, Min: 1, Max: 72
+    campaignId?: string;
+    maxResolves?: number;
+}
+
+// Create workflow response
+export interface CreateWorkflowResponse {
+    success: true;
+    workflowId: string;
+    deepLinkUrl: string;
+}
+
+// Resolve workflow response
+export interface ResolveWorkflowResponse {
+    success: true;
+    type: WorkflowType;
+    status: WorkflowStatus;
+    payload: LogWeightPayload;
+    expiresAt: string; // ISO 8601
+}
+
+// Complete workflow response
+export interface CompleteWorkflowResponse {
+    success: true;
+    status: "COMPLETED";
+}
+</file>
+
 <file path="functions/.eslintrc.js">
 module.exports = {
     root: true,
@@ -1345,29 +1744,815 @@ module.exports = {
 }
 </file>
 
-<file path="firestore.rules">
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-    // All Firestore access is through Cloud Functions only
-    // No direct client access allowed
-    
-    // Devices collection - backend only
-    match /devices/{deviceId} {
-      allow read, write: if false;
-    }
-    
-    // Nudges collection - backend only
-    match /nudges/{nudgeId} {
-      allow read, write: if false;
-    }
-    
-    // Deny all other access
-    match /{document=**} {
-      allow read, write: if false;
-    }
+<file path="ai_strategy.md">
+# AI Observability & Evaluation Strategy
+
+## 1. Observability: "What is happening right now?"
+
+Observability goes beyond simple logging. It answers questions like *"Why did that request cost $0.05?"* or *"Why is the model hallucinating hot dogs as carrots?"*.
+
+### A. The "Black Box" Recorder
+We are currently logging inputs (Image Hash) and outputs (Parsed JSON). We need to enrich this.
+
+**Action Items:**
+1.  **Capture Token Usage**: Extract `response.usage` (prompt_tokens, completion_tokens) from OpenAI responses.
+    *   *Why:* To calculate exact COGS (Cost of Goods Sold) per image analysis.
+2.  **Trace ID Propagation**: Ensure a single `traceId` follows the request from the Client -> API -> Stage 1 -> Stage 2 -> Firestore.
+3.  **Model Configuration Snapshot**: Store the exact params used (temperature, max_tokens, prompt_version) alongside the result. You are already doing this with `promptVersion`—excellent.
+
+### B. The Feedback Loop (The "Golden Signal")
+The most valuable signal is **User Correction**.
+If the AI predicts "150g Chicken Breast" and the user changes it to "200g Steak", that is a high-quality training example.
+
+**Implementation Approach:**
+1.  **Link Analysis to Entry**: When the user saves a meal, pass the `FoodAnalysisRecord.id` that generated the data.
+2.  **The "Act vs. Predict" Diff**: Trigger a background function on meal save:
+    *   **Predicted**: { food: "Chicken", calories: 200 } (from `FoodAnalysisRecord`)
+    *   **Actual**: { food: "Steak", calories: 450 } (from `MealLog`)
+    *   **Metric**: Calculate `Error %` or `Semantic Distance`.
+3.  **Flagging**: If `Error % > 50%`, flag the image for manual review (to be added to your Golden Dataset).
+
+---
+
+## 2. Evaluations (Evals): "Is it getting better?"
+
+Never deploy a prompt change without running Evals. It protects you from regression (e.g., you fix "Pizza detection" but break "Salad detection").
+
+### A. The "Golden Dataset"
+You need a "Truth Set".
+
+**Structure:**
+*   Folder: `evals/dataset/`
+*   Content:
+    *   `pizza_01.jpg` -> `pizza_01.json` (Expected: "Pizza", ~300kcal)
+    *   `salad_bowl.jpg` -> `salad_bowl.json` (Expected: "Mixed Greens", ~50kcal)
+*   **Size**: Start with 20 diverse images. Aim for 50.
+
+### B. Automated Eval Pipeline (CI/CD for AI)
+Create a script (e.g., `npm run eval`) that:
+1.  Iterates through your Golden Dataset.
+2.  Runs your *current* `vision.ts` logic against each image.
+3.  **Scores the result** against the `.json` truth file.
+
+**Scoring Metrics:**
+1.  **Hit Rate (Classification)**: Did it identify the "Pizza"? (Yes/No)
+    *   *Implementation*: `string similarity` check or `LLM-as-a-Judge` ("Does 'Margherita Pie' mean 'Pizza'?").
+2.  **MAE (Mean Absolute Error) for Calories**: `Abs(Predicted - Actual)`.
+    *   *Goal*: Minimize this number across the dataset.
+
+### C. LLM-as-a-Judge
+Instead of writing complex Regex to compare "Steak" vs "Beef Steak", use a cheap LLM (gpt-4o-mini) to grade the response.
+
+**Prompt for Judge:**
+> "Ground truth is 'Grilled Chicken Salad'. Model predicted 'Chicken Caesar Salad'. On a scale of 0-1, how accurate is this? 1 = Correct, 0 = Wrong."
+
+---
+
+## 3. Implementation Roadmap
+
+### Phase 1: Passive Observation (Low Effort)
+- [ ] Update `vision.ts` to log token usage and costs.
+- [ ] Add `parentAnalysisId` to your `FoodLog` schema to link saved meals back to AI predictions.
+
+### Phase 2: dataset Accumulation
+- [ ] Create a script to query Firestore for "High Correction" events (where user changed >50% of values).
+- [ ] Download these images + user's "Actual" data to form your **Golden Dataset**.
+
+### Phase 3: Automated Evals
+- [ ] Write the `evals/run.ts` script.
+- [ ] Run this script before every prompt edit.
+</file>
+
+<file path="deferred_deeplink.md">
+Good. Now we stop philosophizing and write something you could hand to an engineer.
+
+We’ll define a **backend technical specification** for:
+
+> Workflow-driven deferred deep linking
+> Using Firebase (Functions + Firestore)
+> Frontend hosted on Vercel
+
+No hand-waving. Concrete contracts.
+
+---
+
+# 1. System Overview
+
+## Objective
+
+Implement a server-authoritative workflow system that:
+
+* Generates workflow IDs
+* Resolves workflow state after install
+* Enforces TTL and ownership
+* Supports deferred deep linking
+* Is idempotent
+* Is auditable
+
+All routing decisions are driven by backend state.
+
+---
+
+# 2. Data Model (Firestore)
+
+## 2.1 Collection: `workflows`
+
+**Path**
+
+```
+/workflows/{workflowId}
+```
+
+### Schema
+
+```ts
+interface Workflow {
+  id: string                // WF_xxx (doc id)
+  type: string              // LOG_WEIGHT | START_CHALLENGE | etc
+  status: "ACTIVE" | "COMPLETED" | "EXPIRED"
+  
+  payload: {
+    // Arbitrary JSON
+    suggestedWeight?: number
+    source?: string
+  }
+
+  userId: string | null     // null = public workflow
+  campaignId?: string
+
+  createdAt: Timestamp
+  expiresAt: Timestamp
+
+  completedAt?: Timestamp
+
+  metadata: {
+    clickCount: number
+    resolveCount: number
+    lastResolvedAt?: Timestamp
   }
 }
+```
+
+---
+
+## 2.2 Collection: `workflowClicks` (Optional but Recommended)
+
+Used for attribution + debugging.
+
+```
+/workflowClicks/{clickId}
+```
+
+```ts
+{
+  workflowId: string
+  createdAt: Timestamp
+  ipHash: string
+  userAgent: string
+  installReferrerToken?: string
+}
+```
+
+---
+
+# 3. Workflow ID Format
+
+Format:
+
+```
+WF_{ULID}
+```
+
+Use ULID (time-sortable unique ID) instead of random UUID.
+
+Reason:
+
+* Easier debugging
+* Ordered by creation time
+* Safer for analytics queries
+
+---
+
+# 4. Firebase Functions (HTTP + Callable)
+
+All endpoints validate input strictly.
+
+---
+
+# 4.1 Create Workflow
+
+### Endpoint
+
+```
+POST /api/workflows
+```
+
+### Auth
+
+Required (Firebase Auth)
+
+### Request
+
+```json
+{
+  "type": "LOG_WEIGHT",
+  "payload": {
+    "suggestedWeight": 72.5
+  },
+  "expiresInHours": 48,
+  "campaignId": "JAN_CAMPAIGN"
+}
+```
+
+### Logic
+
+1. Validate type against allowed enum.
+2. Enforce max TTL (e.g., 72 hours).
+3. Generate ULID.
+4. Store workflow doc.
+5. Return deep link URL.
+
+### Response
+
+```json
+{
+  "workflowId": "WF_01HRX...",
+  "deepLinkUrl": "https://platewise.app/wf/WF_01HRX..."
+}
+```
+
+---
+
+# 4.2 Resolve Workflow
+
+### Endpoint
+
+```
+GET /api/workflows/{workflowId}
+```
+
+### Auth
+
+Optional (depends on workflow type)
+
+### Logic
+
+1. Fetch document.
+2. If not found → 404.
+3. If status = COMPLETED → return COMPLETED.
+4. If expiresAt < now → mark EXPIRED, return EXPIRED.
+5. If userId != null and user not authenticated → 401.
+6. If userId != null and mismatch → 403.
+7. Increment resolveCount.
+8. Return workflow payload.
+
+### Response
+
+```json
+{
+  "type": "LOG_WEIGHT",
+  "status": "ACTIVE",
+  "payload": {
+    "suggestedWeight": 72.5
+  },
+  "expiresAt": "2026-02-05T00:00:00Z"
+}
+```
+
+---
+
+# 4.3 Complete Workflow
+
+### Endpoint
+
+```
+POST /api/workflows/{workflowId}/complete
+```
+
+### Auth
+
+Required
+
+### Logic
+
+Atomic Firestore transaction:
+
+1. Fetch workflow.
+2. If status != ACTIVE → return idempotent success.
+3. Update:
+
+   * status = COMPLETED
+   * completedAt = now
+4. Commit.
+
+### Response
+
+```json
+{
+  "status": "COMPLETED"
+}
+```
+
+Idempotent by design.
+
+---
+
+# 5. Deferred Deep Link Resolution (Android)
+
+## Install Referrer Handling
+
+Frontend retrieves:
+
+```
+workflow_id=WF_123
+```
+
+Frontend then calls:
+
+```
+GET /api/workflows/WF_123
+```
+
+Backend remains authoritative.
+
+No special backend endpoint required.
+
+---
+
+# 6. Web Link Handling (Vercel)
+
+You must create:
+
+```
+/wf/[workflowId]
+```
+
+### Behavior
+
+Server-side:
+
+1. Validate workflowId format.
+2. Log click (optional).
+3. Detect user-agent.
+4. If Android:
+
+   * Redirect to Play Store with referrer:
+
+     ```
+     referrer=workflow_id=WF_123
+     ```
+5. If iOS:
+
+   * Redirect to App Store (no native referrer equivalent).
+6. If desktop:
+
+   * Show fallback page with QR.
+
+---
+
+# 7. Expiry Enforcement
+
+Two layers:
+
+## Lazy Expiry
+
+When resolving, if expired:
+
+* Mark EXPIRED
+* Return EXPIRED
+
+## Scheduled Cleanup (Optional)
+
+Firebase Scheduled Function runs daily:
+
+* Query workflows where:
+
+  * status = ACTIVE
+  * expiresAt < now
+* Mark as EXPIRED
+
+---
+
+# 8. Retry Strategy (Backend)
+
+Backend should be stateless.
+
+Client handles retry logic.
+
+However:
+
+* Ensure GET /workflow is idempotent.
+* No side effects except metadata counters.
+* Counters should use atomic increment.
+
+---
+
+# 9. Security Rules (Firestore)
+
+Block direct client writes.
+
+Firestore Rules:
+
+```js
+match /workflows/{id} {
+  allow read: if false;
+  allow write: if false;
+}
+```
+
+All operations must go through Functions.
+
+---
+
+# 10. Rate Limiting
+
+Protect resolve endpoint.
+
+Option 1:
+
+* Firebase App Check
+
+Option 2:
+
+* Track IP + throttle > 30 requests/min per workflow
+
+Prevents brute-force enumeration.
+
+---
+
+# 11. Observability
+
+Log structured events:
+
+* workflow_created
+* workflow_resolved
+* workflow_completed
+* workflow_expired
+
+Store in BigQuery or analytics system.
+
+---
+
+# 12. Failure Modes
+
+## Case 1 — Workflow Not Found
+
+Return 404.
+Frontend shows generic fallback.
+
+## Case 2 — Expired
+
+Return EXPIRED.
+Frontend navigates to home.
+
+## Case 3 — Already Completed
+
+Return COMPLETED.
+Frontend navigates to trends.
+
+---
+
+# 13. Idempotency Rules
+
+* Resolve = safe
+* Complete = transactional
+* Duplicate complete calls = safe
+* Expiry auto-update = safe
+
+System must tolerate:
+
+* Multiple app launches
+* Network retries
+* Double clicks
+* App restarts
+
+---
+
+# 14. Non-Goals
+
+Backend does NOT:
+
+* Navigate screens
+* Trust install referrer blindly
+* Auto-complete workflows
+* Store sensitive client state
+
+---
+
+# 15. Minimal Deployment Stack
+
+Firebase:
+
+* Firestore
+* Cloud Functions (HTTP)
+* Scheduled Functions
+* App Check
+
+Vercel:
+
+* Next.js route handler for `/wf/[workflowId]`
+
+---
+
+# What You Now Have
+
+Not “deferred deep link.”
+
+You have:
+
+A deterministic workflow execution backend with:
+
+* TTL
+* Ownership
+* Idempotency
+* State transitions
+* Attribution hooks
+* Platform-agnostic resolution
+
+When you later move to fintech, you change:
+
+```
+type = LOG_WEIGHT
+```
+
+to
+
+```
+type = BBPS_PAYMENT
+```
+
+And the backend shape barely changes.
+
+That’s the point.
+
+Architecture is reusable when it’s state-driven, not screen-driven.
+
+If you want, next we can define the exact Next.js Vercel handler spec and Android install referrer parsing spec in similar detail.
+</file>
+
+<file path="future_scope.md">
+# Future Scope: Deferred Deep Links
+
+Deferred features for rate limiting, scheduled cleanup, iOS support, and analytics.
+
+---
+
+## Rate Limiting
+
+### Option 1: Firebase App Check
+
+Add device attestation to prevent abuse.
+
+```typescript
+// Enable App Check in your Firebase console
+// Frontend: Initialize App Check with reCAPTCHA or device attestation
+import { initializeAppCheck, ReCaptchaV3Provider } from "firebase/app-check";
+
+initializeAppCheck(app, {
+  provider: new ReCaptchaV3Provider("your-recaptcha-site-key"),
+  isTokenAutoRefreshEnabled: true
+});
+```
+
+Backend verification:
+```typescript
+import { getAppCheck } from "firebase-admin/app-check";
+
+async function verifyAppCheck(req: Request) {
+  const appCheckToken = req.headers["x-firebase-appcheck"];
+  if (appCheckToken) {
+    try {
+      await getAppCheck().verifyToken(appCheckToken);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+```
+
+### Option 2: IP-Based Throttling
+
+Track IP hash on resolve and throttle > 30 requests/min per workflow.
+
+```typescript
+// Add to resolve workflow
+const ipHash = crypto.createHash('sha256')
+  .update(req.ip || '')
+  .digest('hex')
+  .substring(0, 16);
+
+console.log(JSON.stringify({
+  event: "workflow_resolved",
+  workflowId,
+  ipHash,
+  timestamp: new Date().toISOString()
+}));
+```
+
+### Option 3: Cloud Armor (GCP)
+
+If publicly exposed, add Cloud Armor WAF rules for:
+- Geographic restrictions
+- Rate limiting by IP
+- Bot protection
+
+---
+
+## Scheduled Expiry Cleanup
+
+Run daily at 2 AM IST to clean up expired workflows:
+
+```typescript
+// functions/src/scheduled/workflowCleanup.ts
+import * as functions from "firebase-functions/v2/scheduler";
+import { db } from "../services/firestore";
+import { Timestamp } from "firebase-admin/firestore";
+
+export const cleanupExpiredWorkflows = functions.onSchedule(
+  {
+    schedule: "0 2 * * *",  // Daily at 2 AM
+    timeZone: "Asia/Kolkata",
+  },
+  async () => {
+    const now = Timestamp.now();
+    const batch = db.batch();
+    let count = 0;
+
+    const expiredDocs = await db.collection("workflows")
+      .where("status", "==", "ACTIVE")
+      .where("expiresAt", "<", now)
+      .limit(500)
+      .get();
+
+    expiredDocs.forEach((doc) => {
+      batch.update(doc.ref, { status: "EXPIRED" });
+      count++;
+    });
+
+    if (count > 0) {
+      await batch.commit();
+      console.log(JSON.stringify({
+        event: "workflow_cleanup_completed",
+        expiredCount: count,
+        timestamp: now.toDate().toISOString()
+      }));
+    }
+  }
+);
+```
+
+---
+
+## iOS Deferred Deep Linking
+
+iOS App Store doesn't support install referrers. Alternatives:
+
+### Option A: Fingerprinting (Not Recommended)
+
+Match IP + User Agent between web click and app launch.
+- Privacy concerns
+- Low accuracy
+- GDPR implications
+
+### Option B: Clipboard-Based
+
+1. Copy workflow ID to clipboard before redirect
+2. App reads clipboard on first launch
+3. Prompt user for permission (iOS 14+)
+
+```swift
+// After redirect, copy to clipboard
+UIPasteboard.general.string = "WF_01HRX..."
+
+// In app, after permission
+if let workflowId = UIPasteboard.general.string,
+   workflowId.hasPrefix("WF_") {
+    resolveWorkflow(workflowId)
+}
+```
+
+### Option C: Skip iOS (MVP)
+
+Focus on Android. iOS users get normal install flow.
+
+---
+
+## Distributed Counters (High Traffic)
+
+For campaigns exceeding 1 write/second per workflow:
+
+```typescript
+// Create sharded counter
+const SHARD_COUNT = 10;
+
+async function incrementResolveCount(workflowId: string) {
+  const shardId = Math.floor(Math.random() * SHARD_COUNT);
+  const shardRef = db.doc(`workflowStats/${workflowId}/shards/${shardId}`);
+  
+  await shardRef.set({
+    count: FieldValue.increment(1)
+  }, { merge: true });
+}
+
+async function getResolveCount(workflowId: string): Promise<number> {
+  const shards = await db.collection(`workflowStats/${workflowId}/shards`).get();
+  return shards.docs.reduce((total, doc) => total + (doc.data().count || 0), 0);
+}
+```
+
+---
+
+## BigQuery Analytics
+
+Export workflow events for analytics:
+
+1. Enable Firestore to BigQuery extension
+2. Create materialized views for:
+   - Campaign performance
+   - Conversion rates
+   - TTL optimization
+
+```sql
+-- Example: Campaign conversion rate
+SELECT
+  campaignId,
+  COUNT(*) as total_created,
+  COUNTIF(status = 'COMPLETED') as completed,
+  COUNTIF(status = 'EXPIRED') as expired,
+  SAFE_DIVIDE(COUNTIF(status = 'COMPLETED'), COUNT(*)) as conversion_rate
+FROM `your_project.workflows`
+GROUP BY campaignId
+ORDER BY conversion_rate DESC
+```
+</file>
+
+<file path="implementation_plan.md">
+# Plan: Behavioral Influence Engine (V3)
+
+## Goal
+Build a programmable motivation engine. Move from "Personalized Notifications" to a robust system that can inject behavioral context into any campaign.
+
+## Core Architecture
+**Pipeline**: `Campaign Intent` → `User Selection` → `Context Resolution` → `Rendering` → `Delivery`
+
+## Detailed Implementation Steps
+
+### 1. Data Layer: Context Resolution (`functions/src/services/user.ts`)
+*   **Rename**: `resolvePersonalizationContext(uid: string)` (was `buildUserContext`)
+*   **Robustness**: Ensure stability. Never throw on missing data.
+    ```typescript
+    return {
+      displayName: safeString(user?.displayName, "Friend"),
+      timezone: user?.timezone ?? "UTC", // Default to UTC
+      // Future: daysSinceLastLog, currentStreak, etc.
+    };
+    ```
+
+### 2. Logic Layer: Campaign Abstraction (`functions/src/campaigns/types.ts`)
+*   **Interface**: Decouple campaign logic from handlers.
+    ```typescript
+    interface Campaign {
+      id: string;
+      templateId: string;
+      // Returns devices that *should* receive this campaign
+      selectEligibleDevices(): Promise<DeviceDocument[]>;
+    }
+    ```
+*   **Implementation**: `DailyNudgeCampaign` implements this interface.
+
+### 3. Infrastructure: Template Registry (`functions/src/config/templates.ts`)
+*   **Definition**: Central template config.
+    ```typescript
+    export const TEMPLATES = {
+      WEIGHT_REMINDER_V1: {
+        id: "weight_reminder_v1",
+        title: "Good morning, {{displayName}}! ⚖️",
+        body: "Time to log your weight."
+      }
+    };
+    ```
+
+### 4. Operational Layer: Orchestration & Delivery (`functions/src/handlers/sendDailyNudge.ts`)
+*   **Chunking Strategy**:
+    *   **Selection**: Fetch all eligible devices.
+    *   **Context Batching**: Process 500 UIDs at a time to build context (prevents memory spikes).
+    *   **Delivery Batching**: `fcm.sendBatchNotifications` handles its own 500-device limit.
+*   **Idempotency**:
+    *   **Notification ID**: `${campaignId}_${activeDate}_${uid}`
+    *   Example: `weight_reminder_v1_2024-03-20_user123`
+    *   Prevents duplicate sends if the job retries.
+
+### 5. Transport Layer: "Dumb" FCM (`functions/src/services/fcm.ts`)
+*   **Responsibility**: Pure transport.
+*   **Signature**: `sendBatchNotifications(payloads: PreparedNotification[])`
+
+## Verification
+1.  **Unit Tests**:
+    *   `resolvePersonalizationContext`: Test with null user, empty fields, and valid data.
+    *   `renderTemplate`: Test variable replacement.
+2.  **Integration**: Run `DailyNudgeCampaign` selection logic to ensure it picks correct devices.
 </file>
 
 <file path="README.md">
@@ -1936,6 +3121,332 @@ export async function logNudge(nudge: Omit<NudgeDocument, "sentAt">): Promise<vo
 export { db, admin };
 </file>
 
+<file path="functions/src/services/user.ts">
+import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
+import { logger } from "firebase-functions/v2";
+import { errors } from "../utils/errors";
+
+const db = getFirestore();
+
+// Default free credits for new users
+const DEFAULT_FREE_CREDITS = 20;
+
+/**
+ * Safe string extraction with fallback.
+ * Never throws, always returns a string.
+ */
+function safeString(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
+  }
+  return fallback;
+}
+
+/**
+ * Derives time of day from timezone.
+ * Returns "morning", "afternoon", or "evening" based on local hour.
+ */
+function getTimeOfDay(timezone: string): "morning" | "afternoon" | "evening" {
+  try {
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "numeric",
+      hour12: false,
+    });
+    const hour = parseInt(formatter.format(now), 10);
+
+    if (hour >= 5 && hour < 12) return "morning";
+    if (hour >= 12 && hour < 17) return "afternoon";
+    return "evening";
+  } catch {
+    // Invalid timezone, default to morning
+    return "morning";
+  }
+}
+
+/**
+ * Personalization context for notification rendering.
+ * Designed for Tier 1 variables now, extensible for Tier 2 (streaks, etc).
+ */
+export interface PersonalizationContext {
+  displayName: string;
+  timezone: string;
+  timeOfDay: "morning" | "afternoon" | "evening";
+  // Tier 2 (future): daysSinceLastLog, currentStreak, goalType
+}
+
+/**
+ * User document structure
+ */
+export interface UserDocument {
+  aiCredits: number;
+  totalGranted: number;
+  totalUsed: number;
+  displayName?: string;
+  timezone?: string;
+  createdAt: Timestamp;
+  lastActiveAt: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+/**
+ * Initialize a new user with free credits
+ * Called on first authentication
+ */
+export async function initializeUser(uid: string): Promise<UserDocument> {
+  const userRef = db.collection("users").doc(uid);
+
+  const existingUser = await userRef.get();
+  if (existingUser.exists) {
+    logger.info(`User ${uid} already exists, returning existing data`);
+    return existingUser.data() as UserDocument;
+  }
+
+  const now = Timestamp.now();
+  const userData: UserDocument = {
+    aiCredits: DEFAULT_FREE_CREDITS,
+    totalGranted: DEFAULT_FREE_CREDITS,
+    totalUsed: 0,
+    createdAt: now,
+    lastActiveAt: now,
+  };
+
+  await userRef.set(userData);
+  logger.info(`Initialized new user ${uid} with ${DEFAULT_FREE_CREDITS} credits`);
+
+  return userData;
+}
+
+/**
+ * Get or create user data
+ */
+export async function getOrCreateUser(uid: string): Promise<UserDocument> {
+  const userRef = db.collection("users").doc(uid);
+  const userDoc = await userRef.get();
+
+  if (!userDoc.exists) {
+    return initializeUser(uid);
+  }
+
+  // Update last active timestamp
+  await userRef.update({ lastActiveAt: FieldValue.serverTimestamp() });
+
+  return userDoc.data() as UserDocument;
+}
+
+/**
+ * Get current credit balance
+ */
+export async function getCredits(uid: string): Promise<number> {
+  const user = await getOrCreateUser(uid);
+  return user.aiCredits;
+}
+
+/**
+ * Deduct one credit from user balance
+ * Uses transaction to prevent race conditions
+ * Throws INSUFFICIENT_CREDITS if balance is 0
+ */
+export async function deductCredit(uid: string): Promise<number> {
+  const userRef = db.collection("users").doc(uid);
+
+  const newBalance = await db.runTransaction(async (transaction) => {
+    const userDoc = await transaction.get(userRef);
+
+    if (!userDoc.exists) {
+      // Initialize user first
+      const now = Timestamp.now();
+      const userData: UserDocument = {
+        aiCredits: DEFAULT_FREE_CREDITS,
+        totalGranted: DEFAULT_FREE_CREDITS,
+        totalUsed: 0,
+        createdAt: now,
+        lastActiveAt: now,
+      };
+      transaction.set(userRef, userData);
+      // Deduct one credit
+      transaction.update(userRef, {
+        aiCredits: DEFAULT_FREE_CREDITS - 1,
+        totalUsed: 1,
+        lastActiveAt: FieldValue.serverTimestamp(),
+      });
+      return DEFAULT_FREE_CREDITS - 1;
+    }
+
+    const userData = userDoc.data() as UserDocument;
+
+    if (userData.aiCredits <= 0) {
+      throw errors.insufficientCredits();
+    }
+
+    const newCredits = userData.aiCredits - 1;
+    transaction.update(userRef, {
+      aiCredits: newCredits,
+      totalUsed: FieldValue.increment(1),
+      lastActiveAt: FieldValue.serverTimestamp(),
+    });
+
+    return newCredits;
+  });
+
+  logger.info(`Deducted credit for user ${uid}, remaining: ${newBalance}`);
+  return newBalance;
+}
+
+/**
+ * Add credits to user balance (for future admin/payment use)
+ */
+export async function addCredits(uid: string, amount: number): Promise<number> {
+  const userRef = db.collection("users").doc(uid);
+
+  await userRef.update({
+    aiCredits: FieldValue.increment(amount),
+    totalGranted: FieldValue.increment(amount),
+    lastActiveAt: FieldValue.serverTimestamp(),
+  });
+
+  const updated = await userRef.get();
+  const credits = (updated.data() as UserDocument).aiCredits;
+
+  logger.info(`Added ${amount} credits to user ${uid}, new balance: ${credits}`);
+  return credits;
+}
+
+// ============================================================================
+// PERSONALIZATION FUNCTIONS
+// ============================================================================
+
+/**
+ * Upsert user profile fields (displayName, timezone).
+ * Only updates fields that are provided (undefined fields are ignored).
+ * Never throws - profile is not critical to registration.
+ */
+export async function upsertUserProfile(
+  uid: string,
+  data: { displayName?: string; timezone?: string },
+): Promise<void> {
+  const userRef = db.collection("users").doc(uid);
+  const now = Timestamp.now();
+
+  const updateData: Record<string, unknown> = {
+    updatedAt: now,
+    lastActiveAt: now,
+  };
+
+  if (data.displayName !== undefined) {
+    updateData.displayName = data.displayName;
+  }
+  if (data.timezone !== undefined) {
+    updateData.timezone = data.timezone;
+  }
+
+  try {
+    const doc = await userRef.get();
+    if (doc.exists) {
+      await userRef.update(updateData);
+      logger.info(`Updated user profile: ${uid}`);
+    } else {
+      // Create new profile with defaults + credits
+      const newProfile: UserDocument = {
+        aiCredits: DEFAULT_FREE_CREDITS,
+        totalGranted: DEFAULT_FREE_CREDITS,
+        totalUsed: 0,
+        displayName: safeString(data.displayName, ""),
+        timezone: safeString(data.timezone, "UTC"),
+        createdAt: now,
+        lastActiveAt: now,
+        updatedAt: now,
+      };
+      await userRef.set(newProfile);
+      logger.info(`Created user profile: ${uid} with ${DEFAULT_FREE_CREDITS} credits`);
+    }
+  } catch (error) {
+    logger.error(`Failed to upsert user profile: ${uid}`, { error });
+    // Don't throw - user profile is not critical to registration
+  }
+}
+
+/**
+ * Resolves personalization context for a single user.
+ * NEVER throws - always returns a valid context with safe defaults.
+ */
+export async function resolvePersonalizationContext(
+  uid: string,
+): Promise<PersonalizationContext> {
+  try {
+    const doc = await db.collection("users").doc(uid).get();
+    const data = doc.data() as UserDocument | undefined;
+
+    const displayName = safeString(data?.displayName, "Friend");
+    const timezone = safeString(data?.timezone, "UTC");
+
+    return {
+      displayName,
+      timezone,
+      timeOfDay: getTimeOfDay(timezone),
+    };
+  } catch (error) {
+    logger.warn(`Failed to resolve context for ${uid}, using defaults`, { error });
+    return {
+      displayName: "Friend",
+      timezone: "UTC",
+      timeOfDay: "morning",
+    };
+  }
+}
+
+/**
+ * Batch resolve personalization context for multiple users.
+ * Efficient for processing large numbers of users (uses Firestore getAll).
+ *
+ * @param uids Array of user IDs to resolve
+ * @returns Map of uid -> PersonalizationContext
+ */
+export async function resolveContextBatch(
+  uids: string[],
+): Promise<Map<string, PersonalizationContext>> {
+  const contextMap = new Map<string, PersonalizationContext>();
+
+  if (uids.length === 0) {
+    return contextMap;
+  }
+
+  try {
+    // Get document references for all UIDs
+    const refs = uids.map((uid) => db.collection("users").doc(uid));
+    const snapshots = await db.getAll(...refs);
+
+    for (let i = 0; i < uids.length; i++) {
+      const uid = uids[i];
+      const snapshot = snapshots[i];
+      const data = snapshot.exists ? (snapshot.data() as UserDocument) : undefined;
+
+      const displayName = safeString(data?.displayName, "Friend");
+      const timezone = safeString(data?.timezone, "UTC");
+
+      contextMap.set(uid, {
+        displayName,
+        timezone,
+        timeOfDay: getTimeOfDay(timezone),
+      });
+    }
+  } catch (error) {
+    logger.warn("Failed to batch resolve contexts, using defaults", { error });
+    // Return defaults for all uids
+    for (const uid of uids) {
+      contextMap.set(uid, {
+        displayName: "Friend",
+        timezone: "UTC",
+        timeOfDay: "morning",
+      });
+    }
+  }
+
+  return contextMap;
+}
+</file>
+
 <file path="functions/src/types/visionSchemas.ts">
 import { z } from "zod";
 
@@ -2116,48 +3627,6 @@ export function isVisionError(
 }
 </file>
 
-<file path="functions/package.json">
-{
-  "name": "weigh-backend-functions",
-  "version": "1.0.0",
-  "description": "Firebase Cloud Functions for weight-tracking mobile app",
-  "main": "lib/index.js",
-  "scripts": {
-    "build": "tsc",
-    "build:watch": "tsc --watch",
-    "serve": "npm run build && firebase emulators:start --only functions",
-    "shell": "npm run build && firebase functions:shell",
-    "start": "npm run shell",
-    "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log",
-    "lint": "eslint --ext .ts src/",
-    "lint:fix": "eslint --ext .ts src/ --fix"
-  },
-  "engines": {
-    "node": "20"
-  },
-  "dependencies": {
-    "busboy": "^1.6.0",
-    "cors": "^2.8.5",
-    "firebase-admin": "^12.7.0",
-    "firebase-functions": "^6.1.2",
-    "openai": "^4.77.0",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "@types/busboy": "^1.5.4",
-    "@types/cors": "^2.8.19",
-    "@typescript-eslint/eslint-plugin": "^8.18.1",
-    "@typescript-eslint/parser": "^8.18.1",
-    "eslint": "^8.57.1",
-    "eslint-config-google": "^0.14.0",
-    "eslint-plugin-import": "^2.31.0",
-    "typescript": "^5.7.2"
-  },
-  "private": true
-}
-</file>
-
 <file path=".gitignore">
 # Dependencies
 node_modules/
@@ -2229,29 +3698,33 @@ coverage/
 }
 </file>
 
-<file path="firestore.indexes.json">
-{
-    "indexes": [
-        {
-            "collectionGroup": "events",
-            "queryScope": "COLLECTION",
-            "fields": [
-                {
-                    "fieldPath": "user_id",
-                    "order": "ASCENDING"
-                },
-                {
-                    "fieldPath": "event_name",
-                    "order": "ASCENDING"
-                },
-                {
-                    "fieldPath": "event_timestamp_utc",
-                    "order": "DESCENDING"
-                }
-            ]
-        }
-    ],
-    "fieldOverrides": []
+<file path="firestore.rules">
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All Firestore access is through Cloud Functions only
+    // No direct client access allowed
+    
+    // Devices collection - backend only
+    match /devices/{deviceId} {
+      allow read, write: if false;
+    }
+    
+    // Nudges collection - backend only
+    match /nudges/{nudgeId} {
+      allow read, write: if false;
+    }
+    
+    // Workflows collection - backend only (deferred deep linking)
+    match /workflows/{workflowId} {
+      allow read, write: if false;
+    }
+    
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
 }
 </file>
 
@@ -2637,83 +4110,6 @@ export async function analyzeFoodImage(
 }
 </file>
 
-<file path="functions/src/handlers/registerDevice.ts">
-import { Request, Response } from "express";
-import { logger } from "firebase-functions/v2";
-import { upsertDevice } from "../services/firestore";
-import { trackEventAsync } from "../services/events";
-import { deviceRegistrationSchema, validateInput } from "../utils/validation";
-import { handleError, errors } from "../utils/errors";
-import { EventName } from "../types/behavioral";
-import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
-
-export async function registerDevice(
-  req: Request & AuthenticatedRequest,
-  res: Response,
-): Promise<void> {
-  try {
-    // Only allow POST
-    if (req.method !== "POST") {
-      res.status(405).json({
-        success: false,
-        error: "Method not allowed",
-      });
-      return;
-    }
-
-    // 1. VERIFY AUTH
-    // This connects the request to the Firebase User (Anonymous or Gmail)
-    await new Promise<void>((resolve, reject) => {
-      verifyAuth(req, res, (err?: unknown) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    if (res.headersSent) return;
-
-    const uid = req.uid!; // Securely obtained from token
-
-    // 2. Validate input
-    const validation = validateInput(deviceRegistrationSchema, req.body);
-    if (!validation.success) {
-      throw errors.invalidRequest(validation.error);
-    }
-
-    const { deviceId, fcmToken, platform, timezone } = validation.data;
-
-    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
-
-    // 3. Upsert with UID
-    await upsertDevice(uid, deviceId, fcmToken, platform);
-
-    // 4. Track Event (Now properly attributed to the UID)
-    if (timezone) {
-      trackEventAsync({
-        eventName: EventName.DEVICE_REGISTERED,
-        userId: uid, // Use actual UID now, not deviceId
-        timestamp: new Date().toISOString(),
-        timezone,
-        platform,
-        metadata: {
-          timezone,
-          platform,
-          deviceId, // Keep deviceId in metadata for debugging
-        },
-      }).catch((err) => {
-        logger.warn("Failed to track device registration event", { error: err });
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Device registered successfully",
-    });
-  } catch (error) {
-    handleError(error, res);
-  }
-}
-</file>
-
 <file path="functions/src/services/backup.ts">
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
@@ -3003,6 +4399,170 @@ export const errors = {
 };
 </file>
 
+<file path="functions/package.json">
+{
+  "name": "weigh-backend-functions",
+  "version": "1.0.0",
+  "description": "Firebase Cloud Functions for weight-tracking mobile app",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "shell": "npm run build && firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log",
+    "lint": "eslint --ext .ts src/",
+    "lint:fix": "eslint --ext .ts src/ --fix"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "cors": "^2.8.5",
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.1.2",
+    "openai": "^4.77.0",
+    "ulid": "^3.0.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/busboy": "^1.5.4",
+    "@types/cors": "^2.8.19",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "eslint": "^8.57.1",
+    "eslint-config-google": "^0.14.0",
+    "eslint-plugin-import": "^2.31.0",
+    "typescript": "^5.7.2"
+  },
+  "private": true
+}
+</file>
+
+<file path="firestore.indexes.json">
+{
+    "indexes": [
+        {
+            "collectionGroup": "events",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "user_id",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "event_name",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "event_timestamp_utc",
+                    "order": "DESCENDING"
+                }
+            ]
+        },
+        {
+            "collectionGroup": "workflows",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {
+                    "fieldPath": "status",
+                    "order": "ASCENDING"
+                },
+                {
+                    "fieldPath": "expiresAt",
+                    "order": "ASCENDING"
+                }
+            ]
+        }
+    ],
+    "fieldOverrides": []
+}
+</file>
+
+<file path="functions/src/handlers/registerDevice.ts">
+import { Request, Response } from "express";
+import { logger } from "firebase-functions/v2";
+import { upsertDevice } from "../services/firestore";
+import { upsertUserProfile } from "../services/user";
+import { trackEventAsync } from "../services/events";
+import { deviceRegistrationSchema, validateInput } from "../utils/validation";
+import { handleError, errors } from "../utils/errors";
+import { EventName } from "../types/behavioral";
+import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
+
+export async function registerDevice(
+  req: Request & AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    // Only allow POST
+    if (req.method !== "POST") {
+      res.status(405).json({
+        success: false,
+        error: "Method not allowed",
+      });
+      return;
+    }
+
+    // 1. VERIFY AUTH
+    // This connects the request to the Firebase User (Anonymous or Gmail)
+    await new Promise<void>((resolve, reject) => {
+      verifyAuth(req, res, (err?: unknown) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+
+    const uid = req.uid!; // Securely obtained from token
+
+    // 2. Validate input
+    const validation = validateInput(deviceRegistrationSchema, req.body);
+    if (!validation.success) {
+      throw errors.invalidRequest(validation.error);
+    }
+
+    const { deviceId, fcmToken, platform, timezone, displayName } = validation.data;
+
+    logger.info(`Registering device: ${deviceId} to User: ${uid}`);
+
+    // 3. Upsert user profile (displayName, timezone)
+    await upsertUserProfile(uid, { displayName, timezone });
+
+    // 4. Upsert device (FCM only, no profile data)
+    await upsertDevice(uid, deviceId, fcmToken, platform);
+
+    // 5. Track Event (Now properly attributed to the UID)
+    if (timezone) {
+      trackEventAsync({
+        eventName: EventName.DEVICE_REGISTERED,
+        userId: uid, // Use actual UID now, not deviceId
+        timestamp: new Date().toISOString(),
+        timezone,
+        platform,
+        metadata: {
+          timezone,
+          platform,
+          deviceId, // Keep deviceId in metadata for debugging
+        },
+      }).catch((err) => {
+        logger.warn("Failed to track device registration event", { error: err });
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Device registered successfully",
+    });
+  } catch (error) {
+    handleError(error, res);
+  }
+}
+</file>
+
 <file path="functions/src/utils/validation.ts">
 import { z } from "zod";
 
@@ -3020,6 +4580,7 @@ export const deviceRegistrationSchema = z.object({
     errorMap: () => ({ message: "platform must be 'ios' or 'android'" }),
   }),
   timezone: z.string().min(1).optional(),
+  displayName: z.string().max(100).optional(),
 });
 
 // Food analysis validation schema (deviceId now optional, auth provides uid)
@@ -3069,6 +4630,11 @@ import { getCreditsHandler, getUserProfile } from "./handlers/credits";
 import { registerDevice } from "./handlers/registerDevice";
 import { quickScan } from "./handlers/quickScan";
 import { logEvent } from "./handlers/events";
+import {
+  createWorkflow,
+  resolveWorkflow,
+  completeWorkflow,
+} from "./handlers/workflow";
 
 const app = express();
 
@@ -3085,7 +4651,7 @@ app.use(latencyLogger);
 /**
  * Route Map (v1 - stable)
  * -----------------------
- * POST /register-device  - Device registration (no auth)
+ * POST /register-device  - Device registration (auth required)
  * POST /analyze-food     - Food image analysis (auth required)
  * POST /quick-scan       - Quick food scan (auth required)
  * POST /events           - Event tracking (auth required)
@@ -3094,6 +4660,12 @@ app.use(latencyLogger);
  * GET  /backup-status    - Backup metadata (auth required)
  * GET  /credits          - Credit balance (auth required)
  * GET  /user/me          - User profile (auth required)
+ *
+ * Workflow Routes (deferred deep linking)
+ * ---------------------------------------
+ * POST /workflows        - Create workflow (auth required)
+ * GET  /workflows/:id    - Resolve workflow (public)
+ * POST /workflows/:id/complete - Complete workflow (public)
  *
  * Route paths are considered stable for v1 and will not change
  * without version bump.
@@ -3112,6 +4684,11 @@ app.get("/credits", getCreditsHandler);
 app.get("/user/me", getUserProfile);
 app.post("/events", logEvent);
 
+// Workflow routes (deferred deep linking)
+app.post("/workflows", createWorkflow);
+app.get("/workflows/:id", resolveWorkflow);
+app.post("/workflows/:id/complete", completeWorkflow);
+
 // 404 handler
 app.use((_req: Request, res: Response) => {
   res.status(404).json({
@@ -3127,18 +4704,32 @@ export { app };
 <file path="functions/src/handlers/sendDailyNudge.ts">
 import { logger } from "firebase-functions/v2";
 import { getActiveDevices } from "../services/firestore";
-import { sendBatchNotifications } from "../services/fcm";
+import { sendBatchNotifications, PreparedNotification, SendResult } from "../services/fcm";
+import { resolveContextBatch } from "../services/user";
 import { trackEventAsync } from "../services/events";
-import { NUDGE_TYPES, COLLECTIONS } from "../config/constants";
+import { TemplateId, renderTemplate, getTemplate } from "../config/templates";
+import { COLLECTIONS, LIMITS } from "../config/constants";
 import { EventName } from "../types/behavioral";
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 
 const db = getFirestore();
 
-export type NudgeType = keyof typeof NUDGE_TYPES;
+// Chunk helper for batching
+function chunk<T>(array: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// Get today's date in YYYY-MM-DD format for idempotency
+function getActiveDate(): string {
+  return new Date().toISOString().split("T")[0];
+}
 
 /**
- * Notification document structure (new collection)
+ * Notification document structure
  */
 interface NotificationDocument {
   notification_id: string;
@@ -3161,16 +4752,25 @@ async function logNotification(notification: NotificationDocument): Promise<void
 }
 
 /**
- * Factory function that creates a nudge handler for a specific type.
- * Each nudge type has its own title, body, and deep link.
+ * Factory function that creates a nudge handler for a specific template.
+ * Uses the new personalization pipeline:
+ * 1. Select devices
+ * 2. Batch UIDs
+ * 3. Resolve context
+ * 4. Render templates
+ * 5. Prepare payloads
+ * 6. Deliver
+ * 7. Log results
  */
-export function createNudgeHandler(nudgeType: NudgeType) {
+export function createNudgeHandler(templateId: TemplateId) {
   return async function sendNudge(): Promise<void> {
-    const config = NUDGE_TYPES[nudgeType];
-    logger.info(`Starting ${nudgeType} nudge job`, { link: config.link });
+    const template = getTemplate(templateId);
+    const activeDate = getActiveDate();
+
+    logger.info(`Starting ${templateId} nudge job`, { link: template.link });
 
     try {
-      // Get all active devices
+      // 1. Select all active devices
       const devices = await getActiveDevices();
       logger.info(`Found ${devices.length} active devices`);
 
@@ -3179,79 +4779,140 @@ export function createNudgeHandler(nudgeType: NudgeType) {
         return;
       }
 
-      // Send notifications with deep link
-      const results = await sendBatchNotifications(
-        devices,
-        config.title,
-        config.body,
-        config.link,
-      );
+      // 2. Extract unique UIDs and batch them
+      const uidToDevices = new Map<string, typeof devices>();
+      for (const device of devices) {
+        const existing = uidToDevices.get(device.uid) || [];
+        existing.push(device);
+        uidToDevices.set(device.uid, existing);
+      }
+      const uniqueUids = Array.from(uidToDevices.keys());
+      const uidBatches = chunk(uniqueUids, LIMITS.FCM_BATCH_SIZE);
 
-      // Log each notification result and track events
-      const logPromises = results.map(async (result) => {
-        const deliveryStatus = result.success ? "success" : "failed";
+      const allResults: SendResult[] = [];
 
-        // Log to 'notifications' collection (replaces 'nudges')
-        const notificationDoc: NotificationDocument = {
-          notification_id: result.notificationId,
-          device_id: result.deviceId,
-          uid: result.uid,
-          notification_type: nudgeType,
-          title: config.title,
-          body: config.body,
-          link: config.link,
-          delivery_status: deliveryStatus,
-          ...(result.error && { error_message: result.error }),
-          sent_at: Timestamp.now(),
-        };
+      // Process each UID batch
+      for (const uidBatch of uidBatches) {
+        // 3. Resolve personalization context for batch
+        const contextMap = await resolveContextBatch(uidBatch);
 
-        await logNotification(notificationDoc);
+        // 4 & 5. Render templates and prepare payloads
+        const payloads: PreparedNotification[] = [];
 
-        // Track NOTIFICATION_DELIVERED event (fire-and-forget)
-        trackEventAsync({
-          eventName: EventName.NOTIFICATION_DELIVERED,
-          userId: result.uid, // Use uid for user-level attribution
-          timestamp: new Date().toISOString(),
-          timezone: "UTC",
-          platform: "ios", // Default, we don't know the platform here
-          metadata: {
+        for (const uid of uidBatch) {
+          const context = contextMap.get(uid)!;
+          const rendered = renderTemplate(template, context);
+          const userDevices = uidToDevices.get(uid) || [];
+
+          for (const device of userDevices) {
+            // Idempotent notification ID: prevents duplicates on job retry
+            const notificationId = `${template.id}_${activeDate}_${uid}_${device.deviceId}`;
+
+            payloads.push({
+              fcmToken: device.fcmToken,
+              title: rendered.title,
+              body: rendered.body,
+              notificationId,
+              link: template.link,
+              deviceId: device.deviceId,
+              uid: device.uid,
+            });
+          }
+        }
+
+        // 6. Deliver batch
+        const results = await sendBatchNotifications(payloads);
+        allResults.push(...results);
+
+        // 7. Log each notification result
+        const logPromises = results.map(async (result) => {
+          const payload = payloads.find((p) => p.notificationId === result.notificationId)!;
+          const deliveryStatus = result.success ? "success" : "failed";
+
+          // Log to 'notifications' collection
+          const notificationDoc: NotificationDocument = {
             notification_id: result.notificationId,
-            notification_type: nudgeType,
+            device_id: result.deviceId,
+            uid: result.uid,
+            notification_type: templateId,
+            title: payload.title,
+            body: payload.body,
+            link: template.link,
             delivery_status: deliveryStatus,
-            device_id: result.deviceId, // Keep deviceId for debugging
             ...(result.error && { error_message: result.error }),
-          },
-        }).catch((err) => {
-          logger.warn("Failed to track notification event", {
-            notificationId: result.notificationId,
-            error: err,
+            sent_at: Timestamp.now(),
+          };
+
+          await logNotification(notificationDoc);
+
+          // Track NOTIFICATION_DELIVERED event (fire-and-forget)
+          trackEventAsync({
+            eventName: EventName.NOTIFICATION_DELIVERED,
+            userId: result.uid,
+            timestamp: new Date().toISOString(),
+            timezone: "UTC",
+            platform: "ios", // Default, we may add platform to device doc later
+            metadata: {
+              notification_id: result.notificationId,
+              notification_type: templateId,
+              delivery_status: deliveryStatus,
+              device_id: result.deviceId,
+              ...(result.error && { error_message: result.error }),
+            },
+          }).catch((err) => {
+            logger.warn("Failed to track notification event", {
+              notificationId: result.notificationId,
+              error: err,
+            });
           });
         });
-      });
 
-      await Promise.all(logPromises);
+        await Promise.all(logPromises);
+      }
 
-      const successCount = results.filter((r) => r.success).length;
-      logger.info(`${nudgeType} nudge complete: ${successCount}/${results.length} successful`);
+      const successCount = allResults.filter((r) => r.success).length;
+      logger.info(`${templateId} nudge complete: ${successCount}/${allResults.length} successful`);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      logger.error(`${nudgeType} nudge failed: ${errorMessage}`);
+      logger.error(`${templateId} nudge failed: ${errorMessage}`);
       throw error;
     }
   };
 }
 
-// Legacy export for backward compatibility
-export const sendDailyNudge = createNudgeHandler("WEIGHT_REMINDER");
+// Export handlers using new template IDs
+export const sendDailyNudge = createNudgeHandler("WEIGHT_REMINDER_V1");
+export const sendBreakfastNudge = createNudgeHandler("BREAKFAST_V1");
+export const sendLunchNudge = createNudgeHandler("LUNCH_V1");
+export const sendSnacksNudge = createNudgeHandler("SNACKS_V1");
+export const sendDinnerNudge = createNudgeHandler("DINNER_V1");
+export const sendEveningCheckinNudge = createNudgeHandler("EVENING_CHECKIN_V1");
 </file>
 
 <file path="functions/src/services/fcm.ts">
 import { admin } from "./firestore";
 import { logger } from "firebase-functions/v2";
 import { LIMITS } from "../config/constants";
-import { DeviceDocument } from "../types";
 
-interface SendResult {
+/**
+ * Prepared notification payload - fully rendered, ready for delivery.
+ * FCM service is a "dumb" transport layer - it just sends what it receives.
+ */
+export interface PreparedNotification {
+  fcmToken: string;
+  title: string;
+  body: string;
+  notificationId: string;
+  link?: string;
+  // Metadata for logging (not sent to FCM)
+  deviceId: string;
+  uid: string;
+}
+
+/**
+ * Result of sending a notification.
+ */
+export interface SendResult {
   deviceId: string;
   uid: string;
   notificationId: string;
@@ -3259,6 +4920,9 @@ interface SendResult {
   error?: string;
 }
 
+/**
+ * Send a single push notification via FCM.
+ */
 export async function sendPushNotification(
   fcmToken: string,
   title: string,
@@ -3300,31 +4964,34 @@ export async function sendPushNotification(
   }
 }
 
+/**
+ * Send batch notifications with prepared payloads.
+ * This is a pure transport layer - payloads are already rendered with personalization.
+ *
+ * @param payloads Array of fully prepared notification payloads
+ * @returns Array of send results
+ */
 export async function sendBatchNotifications(
-  devices: DeviceDocument[],
-  title: string,
-  body: string,
-  link?: string,
+  payloads: PreparedNotification[],
 ): Promise<SendResult[]> {
   const results: SendResult[] = [];
 
   // Process in batches to respect FCM limits
-  for (let i = 0; i < devices.length; i += LIMITS.FCM_BATCH_SIZE) {
-    const batch = devices.slice(i, i + LIMITS.FCM_BATCH_SIZE);
+  for (let i = 0; i < payloads.length; i += LIMITS.FCM_BATCH_SIZE) {
+    const batch = payloads.slice(i, i + LIMITS.FCM_BATCH_SIZE);
 
-    const batchPromises = batch.map(async (device) => {
-      const notificationId = crypto.randomUUID();
+    const batchPromises = batch.map(async (payload) => {
       const result = await sendPushNotification(
-        device.fcmToken,
-        title,
-        body,
-        notificationId,
-        link,
+        payload.fcmToken,
+        payload.title,
+        payload.body,
+        payload.notificationId,
+        payload.link,
       );
       return {
-        deviceId: device.deviceId,
-        uid: device.uid,
-        notificationId,
+        deviceId: payload.deviceId,
+        uid: payload.uid,
+        notificationId: payload.notificationId,
         success: result.success,
         error: result.error,
       };
@@ -3424,88 +5091,6 @@ export interface BackupPayload {
     streaks?: Record<string, unknown>;
     metadata?: Record<string, unknown>;
 }
-</file>
-
-<file path="functions/src/config/constants.ts">
-// Configuration constants
-
-export const COLLECTIONS = {
-  DEVICES: "devices",
-  NUDGES: "nudges",
-  FOOD_ANALYSES: "food_analyses",
-  EVENTS: "events",
-  USERS: "users",
-  NOTIFICATIONS: "notifications",
-} as const;
-
-export const LIMITS = {
-  MAX_IMAGE_SIZE_BYTES: 5 * 1024 * 1024, // 5MB
-  DEVICE_ACTIVE_DAYS: 30, // Consider device active if seen within this many days
-  FCM_BATCH_SIZE: 500, // Max devices per FCM batch
-} as const;
-
-export const NUDGE_CONFIG = {
-  DEFAULT_TITLE: "Time to log your weight! ⚖️",
-  DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
-} as const;
-
-export const NUDGE_TYPES = {
-  WEIGHT_REMINDER: {
-    title: "Good morning! ⚖️",
-    body: "Time to log your weight",
-    link: "platewise://entry",
-  },
-  BREAKFAST: {
-    title: "Breakfast time! 🍳",
-    body: "Had breakfast? Snap a quick photo",
-    link: "platewise://food/capture",
-  },
-  LUNCH: {
-    title: "Lunch time! 🥗",
-    body: "Capture what you're eating",
-    link: "platewise://food/capture",
-  },
-  SNACKS: {
-    title: "Snack check 🍎",
-    body: "Snacking? Log it to stay on track",
-    link: "platewise://food/capture",
-  },
-  DINNER: {
-    title: "Dinner time! 🍽️",
-    body: "Don't forget to log your meal",
-    link: "platewise://food/capture",
-  },
-  EVENING_CHECKIN: {
-    title: "Daily check-in 📊",
-    body: "How was your day? Check your progress",
-    link: "platewise://dashboard",
-  },
-} as const;
-
-export const VISION_CONFIG = {
-  MODEL: "gpt-4o",
-  TEXT_MODEL: "gpt-4o", // Text-only model for Stage 2 (no vision capability needed)
-  PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
-  NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
-  MAX_TOKENS: 2048, // Legacy: single-pass mode
-  TIMEOUT_MS: 60000,
-  SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
-  PROMPT_VERSION: "vision_v4_2stage",
-  MIN_CONFIDENCE: 0.6, // Gate Stage 2 if perception confidence is below this
-} as const;
-
-export const FUNCTION_CONFIG = {
-  REGION: "us-central1",
-  TIMEOUT_SECONDS: 60,
-  MEMORY: "256MiB" as const,
-  ANALYSIS_MEMORY: "512MiB" as const,
-} as const;
-
-export const BACKUP_CONFIG = {
-  STORAGE_BUCKET: process.env.STORAGE_BUCKET || "",
-  STORAGE_PATH_PREFIX: "users",
-  BACKUP_FILENAME: "current.gz",
-} as const;
 </file>
 
 <file path="functions/src/services/vision.ts">
@@ -4145,6 +5730,66 @@ export async function quickAnalyzeFood(imageBase64: string): Promise<{
 }
 </file>
 
+<file path="functions/src/config/constants.ts">
+// Configuration constants
+
+export const COLLECTIONS = {
+  DEVICES: "devices",
+  NUDGES: "nudges",
+  FOOD_ANALYSES: "food_analyses",
+  EVENTS: "events",
+  USERS: "users",
+  NOTIFICATIONS: "notifications",
+} as const;
+
+export const LIMITS = {
+  MAX_IMAGE_SIZE_BYTES: 5 * 1024 * 1024, // 5MB
+  DEVICE_ACTIVE_DAYS: 30, // Consider device active if seen within this many days
+  FCM_BATCH_SIZE: 500, // Max devices per FCM batch
+} as const;
+
+export const NUDGE_CONFIG = {
+  DEFAULT_TITLE: "Time to log your weight! ⚖️",
+  DEFAULT_BODY: "Consistency is key! Take a moment to log your weight today.",
+} as const;
+
+// NUDGE_TYPES moved to config/templates.ts as TEMPLATES
+// Legacy mapping for backward compatibility during migration
+export const LEGACY_NUDGE_TYPE_TO_TEMPLATE = {
+  WEIGHT_REMINDER: "WEIGHT_REMINDER_V1",
+  BREAKFAST: "BREAKFAST_V1",
+  LUNCH: "LUNCH_V1",
+  SNACKS: "SNACKS_V1",
+  DINNER: "DINNER_V1",
+  EVENING_CHECKIN: "EVENING_CHECKIN_V1",
+} as const;
+
+export const VISION_CONFIG = {
+  MODEL: "gpt-4o",
+  TEXT_MODEL: "gpt-4o", // Text-only model for Stage 2 (no vision capability needed)
+  PERCEPTION_MAX_TOKENS: 384, // Stage 1: tight limit for perception-only
+  NUTRITION_MAX_TOKENS: 512, // Stage 2: text-only nutrition estimation
+  MAX_TOKENS: 2048, // Legacy: single-pass mode
+  TIMEOUT_MS: 60000,
+  SUPPORTED_FORMATS: ["image/jpeg", "image/png", "image/webp"],
+  PROMPT_VERSION: "vision_v4_2stage",
+  MIN_CONFIDENCE: 0.6, // Gate Stage 2 if perception confidence is below this
+} as const;
+
+export const FUNCTION_CONFIG = {
+  REGION: "us-central1",
+  TIMEOUT_SECONDS: 60,
+  MEMORY: "256MiB" as const,
+  ANALYSIS_MEMORY: "512MiB" as const,
+} as const;
+
+export const BACKUP_CONFIG = {
+  STORAGE_BUCKET: process.env.STORAGE_BUCKET || "",
+  STORAGE_PATH_PREFIX: "users",
+  BACKUP_FILENAME: "current.gz",
+} as const;
+</file>
+
 <file path="functions/src/index.ts">
 import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
@@ -4206,7 +5851,7 @@ const SCHEDULE_CONFIG = {
  */
 export const weightReminder = onSchedule(
   { schedule: "30 7 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("WEIGHT_REMINDER"),
+  createNudgeHandler("WEIGHT_REMINDER_V1"),
 );
 
 /**
@@ -4215,7 +5860,7 @@ export const weightReminder = onSchedule(
  */
 export const breakfastReminder = onSchedule(
   { schedule: "30 8 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("BREAKFAST"),
+  createNudgeHandler("BREAKFAST_V1"),
 );
 
 /**
@@ -4224,7 +5869,7 @@ export const breakfastReminder = onSchedule(
  */
 export const lunchReminder = onSchedule(
   { schedule: "0 13 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("LUNCH"),
+  createNudgeHandler("LUNCH_V1"),
 );
 
 /**
@@ -4233,7 +5878,7 @@ export const lunchReminder = onSchedule(
  */
 export const snacksReminder = onSchedule(
   { schedule: "0 17 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("SNACKS"),
+  createNudgeHandler("SNACKS_V1"),
 );
 
 /**
@@ -4242,7 +5887,7 @@ export const snacksReminder = onSchedule(
  */
 export const dinnerReminder = onSchedule(
   { schedule: "30 20 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("DINNER"),
+  createNudgeHandler("DINNER_V1"),
 );
 
 /**
@@ -4251,7 +5896,7 @@ export const dinnerReminder = onSchedule(
  */
 export const eveningCheckin = onSchedule(
   { schedule: "30 21 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("EVENING_CHECKIN"),
+  createNudgeHandler("EVENING_CHECKIN_V1"),
 );
 </file>
 
@@ -4278,6 +5923,7 @@ export const eveningCheckin = onSchedule(
    - [Restore](#6-restore)
    - [Backup Status](#7-backup-status)
    - [Device Registration](#8-device-registration)
+   - [Workflows (Deferred Deep Links)](#10-workflows-deferred-deep-links)
 5. [Error Codes](#error-codes)
 6. [Rate Limiting & Credits](#rate-limiting--credits)
 7. [Internal Architecture](#internal-architecture-for-advanced-integrators)
@@ -4354,6 +6000,9 @@ https://api-<deployment-hash>-uc.a.run.app
 | GET | `/backup-status` | Yes | Backup metadata |
 | GET | `/credits` | Yes | Credit balance |
 | GET | `/user/me` | Yes | User profile |
+| POST | `/workflows` | Yes | Create workflow (deferred deep link) |
+| GET | `/workflows/:id` | No | Resolve workflow |
+| POST | `/workflows/:id/complete` | No | Complete workflow |
 
 > Route paths are stable for v2.x and will not change without a major version bump.
 
@@ -4974,7 +6623,8 @@ Content-Type: application/json
   "deviceId": "unique-device-identifier",
   "fcmToken": "firebase-cloud-messaging-token",
   "platform": "ios",
-  "timezone": "Asia/Kolkata"
+  "timezone": "Asia/Kolkata",
+  "displayName": "Ronak"
 }
 ```
 
@@ -4984,6 +6634,10 @@ Content-Type: application/json
 | `fcmToken` | string | 1-4096 characters |
 | `platform` | enum | `"ios"` or `"android"` |
 | `timezone` | string | Optional. IANA timezone (e.g., `"Asia/Kolkata"`) |
+| `displayName` | string | Optional. Max 100 characters. Used for personalized notifications |
+
+> [!NOTE]
+> `displayName` and `timezone` are stored on the **user profile** (not the device) to enable personalized notifications like *"Good morning, Ronak!"*
 
 #### Response
 
@@ -5002,6 +6656,7 @@ const registerDevice = async (data: {
   fcmToken: string;
   platform: 'ios' | 'android';
   timezone?: string;
+  displayName?: string;
 }) => {
   const res = await fetch(
     `${API_BASE}/register-device`,
@@ -5410,6 +7065,279 @@ Recommended user-facing messages for common errors:
 | `IMAGE_TOO_BLURRY` | "This photo is too blurry. Hold your phone steady and try again." |
 | `INSUFFICIENT_CREDITS` | "You've used all your free analyses. Upgrade to continue tracking." |
 | `AI_SERVICE_ERROR` | "Our servers are busy. Please try again in a moment." |
+
+---
+
+## 10. Workflows (Deferred Deep Links)
+
+Server-authoritative workflow system for deferred deep linking. Enables campaigns, email links, and install referrer tracking.
+
+### TypeScript Interfaces
+
+```typescript
+// Workflow types
+type WorkflowType = "LOG_WEIGHT";
+type WorkflowStatus = "ACTIVE" | "COMPLETED" | "EXPIRED";
+
+interface LogWeightPayload {
+  suggestedWeight?: number; // 20-300
+  source?: string;
+}
+
+interface CreateWorkflowRequest {
+  type: WorkflowType;
+  payload?: LogWeightPayload;
+  expiresInHours?: number; // Default: 48, Min: 1, Max: 72
+  campaignId?: string;
+  maxResolves?: number;
+}
+
+interface CreateWorkflowResponse {
+  success: true;
+  workflowId: string;
+  deepLinkUrl: string;
+}
+
+interface ResolveWorkflowResponse {
+  success: true;
+  type: WorkflowType;
+  status: WorkflowStatus;
+  payload: LogWeightPayload;
+  expiresAt: string; // ISO 8601
+}
+
+interface CompleteWorkflowResponse {
+  success: true;
+  status: "COMPLETED";
+}
+```
+
+### Create Workflow
+
+> **Auth Required:** Yes  
+> **Method:** `POST`
+
+```http
+POST /workflows
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "type": "LOG_WEIGHT",
+  "payload": { "suggestedWeight": 72.5, "source": "email_campaign" },
+  "expiresInHours": 48,
+  "campaignId": "JAN_NUDGE"
+}
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "workflowId": "WF_01HRX...",
+  "deepLinkUrl": "https://platewise.app/wf/WF_01HRX..."
+}
+```
+
+### Resolve Workflow
+
+> **Auth Required:** No (public)  
+> **Method:** `GET`
+
+```http
+GET /workflows/WF_01HRX...
+```
+
+**Response (ACTIVE):**
+
+```json
+{
+  "success": true,
+  "type": "LOG_WEIGHT",
+  "status": "ACTIVE",
+  "payload": { "suggestedWeight": 72.5 },
+  "expiresAt": "2026-02-01T00:00:00.000Z"
+}
+```
+
+**Response (EXPIRED):**
+
+```json
+{
+  "success": true,
+  "type": "LOG_WEIGHT",
+  "status": "EXPIRED",
+  "payload": { "suggestedWeight": 72.5 },
+  "expiresAt": "2026-01-30T00:00:00.000Z"
+}
+```
+
+### Complete Workflow
+
+> **Auth Required:** No (public)  
+> **Method:** `POST`
+
+```http
+POST /workflows/WF_01HRX.../complete
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "status": "COMPLETED"
+}
+```
+
+> [!NOTE]
+> Completion is **idempotent** — calling on already-completed workflows returns success.
+
+### Error Codes
+
+| Code | HTTP | Description |
+|------|------|-------------|
+| `INVALID_WORKFLOW_ID` | 400 | Malformed workflow ID format |
+| `INVALID_WORKFLOW_TYPE` | 400 | Unknown workflow type |
+| `INVALID_TTL` | 400 | TTL outside 1-72 hour range |
+| `INVALID_PAYLOAD` | 400 | Payload validation failed |
+| `WORKFLOW_NOT_FOUND` | 404 | Workflow does not exist |
+| `WORKFLOW_EXPIRED` | 409 | Cannot complete expired workflow |
+
+---
+
+## Frontend Integration: Vercel Route Handler
+
+Create `/wf/[workflowId]/route.ts` in your Next.js app:
+
+```typescript
+// app/wf/[workflowId]/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+const PLAY_STORE_URL = "https://play.google.com/store/apps/details";
+const APP_STORE_URL = "https://apps.apple.com/app/idYOUR_APP_ID";
+const PACKAGE_NAME = "com.yourapp.package";
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { workflowId: string } }
+) {
+  const { workflowId } = params;
+  
+  // Validate workflow ID format (prevent injection)
+  if (!/^WF_[0-9A-HJKMNP-TV-Z]{26}$/.test(workflowId)) {
+    return NextResponse.redirect(new URL("/", request.url));
+  }
+  
+  const userAgent = request.headers.get("user-agent") || "";
+  
+  // Detect platform
+  const isAndroid = /android/i.test(userAgent);
+  const isIOS = /iphone|ipad|ipod/i.test(userAgent);
+  
+  if (isAndroid) {
+    // Redirect to Play Store with install referrer
+    const referrer = encodeURIComponent(`workflow_id=${workflowId}`);
+    const playUrl = `${PLAY_STORE_URL}?id=${PACKAGE_NAME}&referrer=${referrer}`;
+    return NextResponse.redirect(playUrl);
+  }
+  
+  if (isIOS) {
+    // Redirect to App Store (no native referrer support)
+    return NextResponse.redirect(APP_STORE_URL);
+  }
+  
+  // Desktop: Show fallback page with QR code
+  return NextResponse.redirect(new URL(`/download?wf=${workflowId}`, request.url));
+}
+```
+
+---
+
+## Frontend Integration: Android Install Referrer
+
+After app install, extract workflow ID from Play Store referrer:
+
+```kotlin
+// Android - Using Play Install Referrer SDK
+// Add dependency: com.android.installreferrer:installreferrer:2.2
+
+class InstallReferrerHelper(private val context: Context) {
+    private lateinit var referrerClient: InstallReferrerClient
+
+    fun getWorkflowId(callback: (String?) -> Unit) {
+        referrerClient = InstallReferrerClient.newBuilder(context).build()
+        
+        referrerClient.startConnection(object : InstallReferrerStateListener {
+            override fun onInstallReferrerSetupFinished(responseCode: Int) {
+                if (responseCode == InstallReferrerClient.OK) {
+                    try {
+                        val referrer = referrerClient.installReferrer.installReferrer
+                        val workflowId = extractWorkflowId(referrer)
+                        callback(workflowId)
+                    } catch (e: Exception) {
+                        callback(null)
+                    }
+                    referrerClient.endConnection()
+                }
+            }
+            
+            override fun onInstallReferrerServiceDisconnected() {
+                callback(null)
+            }
+        })
+    }
+    
+    private fun extractWorkflowId(referrer: String): String? {
+        // Parse: workflow_id=WF_01HRX...
+        val regex = "workflow_id=(WF_[0-9A-HJKMNP-TV-Z]{26})".toRegex()
+        return regex.find(referrer)?.groupValues?.get(1)
+    }
+}
+
+// Usage on first app launch:
+InstallReferrerHelper(context).getWorkflowId { workflowId ->
+    if (workflowId != null) {
+        // Call backend: GET /workflows/{workflowId}
+        resolveWorkflow(workflowId) { response ->
+            when (response.status) {
+                "ACTIVE" -> navigateToWeightEntry(response.payload.suggestedWeight)
+                "COMPLETED" -> navigateToTrends()
+                "EXPIRED" -> navigateToHome()
+            }
+        }
+    }
+}
+```
+
+---
+
+## Workflow Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Email/SMS
+    participant Vercel
+    participant PlayStore
+    participant App
+    participant Backend
+
+    Email/SMS->>User: Click link (platewise.app/wf/WF_123)
+    User->>Vercel: GET /wf/WF_123
+    Vercel->>PlayStore: Redirect with referrer
+    PlayStore->>User: Install app
+    User->>App: Launch app
+    App->>App: Read install referrer
+    App->>Backend: GET /workflows/WF_123
+    Backend->>App: {status: ACTIVE, payload: {...}}
+    App->>User: Navigate to weight entry
+    App->>Backend: POST /workflows/WF_123/complete
+```
+
+> [!IMPORTANT]
+> **Backend does NOT validate install source.** Install attribution is a frontend-only concern. Resolution is allowed from any source — this is by design.
 
 ---
 

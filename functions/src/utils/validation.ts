@@ -33,10 +33,41 @@ export const backupSchema = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
+// Notification preferences validation schema (per-type)
+export const notificationPreferencesSchema = z
+  .object({
+    type: z.enum(["weight", "breakfast", "lunch", "dinner", "snacks"]),
+    enabled: z.boolean(),
+    hour: z.number().int().min(0).max(23).optional(),
+    minute: z
+      .union([
+        z.literal(0),
+        z.literal(10),
+        z.literal(20),
+        z.literal(30),
+        z.literal(40),
+        z.literal(50),
+      ])
+      .optional(),
+    timezone: z.string().min(1).optional(),
+  })
+  .refine(
+    (data) => {
+      // If disabled, time fields are optional
+      if (!data.enabled) return true;
+      // If enabled, must have both hour+minute or neither
+      const hasHour = data.hour !== undefined;
+      const hasMinute = data.minute !== undefined;
+      return hasHour === hasMinute;
+    },
+    { message: "Must provide both hour and minute, or neither" },
+  );
+
 // Type exports from schemas
 export type DeviceRegistrationInput = z.infer<typeof deviceRegistrationSchema>;
 export type FoodAnalysisInput = z.infer<typeof foodAnalysisSchema>;
 export type BackupInput = z.infer<typeof backupSchema>;
+export type NotificationPreferencesInput = z.infer<typeof notificationPreferencesSchema>;
 
 // Validation helper
 export function validateInput<T>(

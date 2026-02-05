@@ -2,7 +2,6 @@ import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { setGlobalOptions } from "firebase-functions/v2";
 import { initializeApp, getApps } from "firebase-admin/app";
-import { createNudgeHandler } from "./handlers/sendDailyNudge";
 import { app } from "./api";
 import { FUNCTION_CONFIG } from "./config/constants";
 
@@ -52,57 +51,30 @@ const SCHEDULE_CONFIG = {
   memory: FUNCTION_CONFIG.MEMORY,
 } as const;
 
-/**
- * Weight Reminder - 7:30 AM IST
- * Opens: platewise://entry
- */
-export const weightReminder = onSchedule(
-  { schedule: "30 7 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("WEIGHT_REMINDER_V1"),
-);
+// =============================================================================
+// UNIFIED NOTIFICATION ENGINE
+// =============================================================================
+//
+// Single cron, single index, per-user scheduling.
+// Replaces: weightReminder, breakfastReminder, lunchReminder, snacksReminder,
+//           dinnerReminder, eveningCheckin, preferredTimeNudge
+// =============================================================================
+
+import { sendUnifiedNotifications } from "./handlers/unifiedCron";
 
 /**
- * Breakfast Reminder - 8:30 AM IST
- * Opens: platewise://food/capture
+ * Unified Notification Cron - Every 10 minutes
+ *
+ * Sends notifications to users at their preferred local time per type.
+ * Uses single nextNotificationUTC index for O(k) query.
+ *
+ * Architecture:
+ * - Queries: WHERE nextNotificationUTC <= now
+ * - Idempotency: Window-based (lastNotificationWindow)
+ * - Atomicity: State updated BEFORE send
  */
-export const breakfastReminder = onSchedule(
-  { schedule: "30 8 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("BREAKFAST_V1"),
-);
-
-/**
- * Lunch Reminder - 1:00 PM IST
- * Opens: platewise://food/capture
- */
-export const lunchReminder = onSchedule(
-  { schedule: "0 13 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("LUNCH_V1"),
-);
-
-/**
- * Snacks Reminder - 5:00 PM IST
- * Opens: platewise://food/capture
- */
-export const snacksReminder = onSchedule(
-  { schedule: "0 17 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("SNACKS_V1"),
-);
-
-/**
- * Dinner Reminder - 8:30 PM IST
- * Opens: platewise://food/capture
- */
-export const dinnerReminder = onSchedule(
-  { schedule: "30 20 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("DINNER_V1"),
-);
-
-/**
- * Evening Check-in - 9:30 PM IST
- * Opens: platewise://dashboard
- */
-export const eveningCheckin = onSchedule(
-  { schedule: "30 21 * * *", ...SCHEDULE_CONFIG },
-  createNudgeHandler("EVENING_CHECKIN_V1"),
+export const unifiedNotificationCron = onSchedule(
+  { schedule: "*/10 * * * *", ...SCHEDULE_CONFIG },
+  sendUnifiedNotifications,
 );
 
