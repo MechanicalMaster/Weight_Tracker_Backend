@@ -16,6 +16,15 @@ import {
 import { VISION_CONFIG, COLLECTIONS } from "../config/constants";
 import { errors } from "../utils/errors";
 import { db, admin } from "./firestore";
+import { uploadFoodImage } from "./imageStorage";
+
+/**
+ * Metadata passed from handlers for eval tracking.
+ */
+export interface AnalysisMetadata {
+  uid: string;
+  mimeType: string;
+}
 
 // Define the API key as a Firebase parameter
 const openaiApiKey = defineString("OPENAI_API_KEY");
@@ -465,7 +474,10 @@ function aggregateToLegacy(result: VisionPassResult): NutritionData {
 // Main Entry Point: 2-Stage Pipeline
 // =============================================================================
 
-export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
+export async function analyzeFood(
+  imageBase64: string,
+  metadata?: AnalysisMetadata,
+): Promise<NutritionData> {
   const startTime = Date.now();
   const apiKey = openaiApiKey.value();
 
@@ -477,6 +489,19 @@ export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
   const { hash: imageHash, byteLength: imageByteLength } = computeImageHash(imageBase64);
 
   logger.info("Starting 2-stage food analysis", { imageHash });
+
+  // ==========================================================================
+  // Upload raw image to Cloud Storage (fire-and-forget, parallel with Stage 1)
+  // ==========================================================================
+  let imageUploadPromise: Promise<string | undefined> = Promise.resolve(undefined);
+  if (metadata) {
+    imageUploadPromise = uploadFoodImage(
+      imageBase64,
+      metadata.uid,
+      imageHash,
+      metadata.mimeType,
+    );
+  }
 
   // ==========================================================================
   // Stage 1: Vision Perception
@@ -519,6 +544,9 @@ export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
     totalMs: totalDurationMs,
   });
 
+  // Await image upload (should be done by now, ran in parallel with Stage 1+2)
+  const imageStorageUrl = await imageUploadPromise;
+
   // ==========================================================================
   // Persist Analysis Record
   // ==========================================================================
@@ -527,6 +555,14 @@ export async function analyzeFood(imageBase64: string): Promise<NutritionData> {
     imageByteLength,
     model: VISION_CONFIG.MODEL,
     promptVersion: VISION_CONFIG.PROMPT_VERSION,
+
+    // Eval metadata
+    imageStorageUrl: imageStorageUrl || undefined,
+    userId: metadata?.uid,
+    mimeType: metadata?.mimeType,
+    source: "full_analysis",
+    promptPerception: PERCEPTION_PROMPT,
+    promptNutrition: NUTRITION_PROMPT,
 
     // Stage 1: Perception
     perceptionRawText: perception.rawText,
@@ -582,7 +618,11 @@ function generateCalorieMessage(calories: number): string {
  * Uses only Stage 1 (perception) for speed.
  * Does NOT persist to Firestore.
  */
-export async function quickAnalyzeFood(imageBase64: string): Promise<{
+export async function quickAnalyzeFood(
+  imageBase64: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _metadata?: AnalysisMetadata,
+): Promise<{
   foodName: string;
   confidence: "high" | "medium" | "low";
   calories: number;

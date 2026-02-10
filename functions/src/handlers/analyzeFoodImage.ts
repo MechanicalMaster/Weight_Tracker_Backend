@@ -164,7 +164,10 @@ export async function analyzeFoodImage(
 
     // Analyze the food image
     const analysisStart = Date.now();
-    const nutrition = await analyzeFood(parsed.imageBase64);
+    const nutrition = await analyzeFood(parsed.imageBase64, {
+      uid,
+      mimeType: parsed.mimeType,
+    });
     const latencyMs = Date.now() - analysisStart;
 
     // Track FOOD_ANALYZED event (fire-and-forget)

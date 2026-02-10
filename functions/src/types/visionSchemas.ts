@@ -128,6 +128,12 @@ export const DivergenceReasonSchema = z.enum([
 ]).optional();
 export type DivergenceReason = z.infer<typeof DivergenceReasonSchema>;
 
+export const AnalysisSourceSchema = z.enum([
+  "full_analysis",
+  "quick_scan",
+]);
+export type AnalysisSource = z.infer<typeof AnalysisSourceSchema>;
+
 export const FoodAnalysisRecordSchema = z.object({
   // Identity
   imageHash: z.string(),
@@ -136,6 +142,14 @@ export const FoodAnalysisRecordSchema = z.object({
   // Model metadata
   model: z.string(),
   promptVersion: z.string(),
+
+  // Eval metadata
+  imageStorageUrl: z.string().optional(), // GCS path for raw image
+  userId: z.string().optional(), // User who submitted the image
+  mimeType: z.string().optional(), // Original image MIME type
+  source: AnalysisSourceSchema.optional(), // Pipeline that produced this record
+  promptPerception: z.string().optional(), // Exact Stage 1 prompt used
+  promptNutrition: z.string().optional(), // Exact Stage 2 prompt used
 
   // 2-Stage Architecture: Perception (Stage 1)
   perceptionRawText: z.string().optional(),

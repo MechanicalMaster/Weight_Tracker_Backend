@@ -5,7 +5,7 @@ import { errors } from "../utils/errors";
 const db = getFirestore();
 
 // Default free credits for new users
-const DEFAULT_FREE_CREDITS = 20;
+const DEFAULT_FREE_CREDITS = 40;
 
 /**
  * Safe string extraction with fallback.

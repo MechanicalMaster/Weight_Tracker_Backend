@@ -10,12 +10,12 @@ import { AuthenticatedRequest, verifyAuth } from "../middleware/auth";
 
 // Extend Express Request to include rawBody (added by Firebase Functions)
 interface FirebaseRequest extends Request {
-    rawBody?: Buffer;
+  rawBody?: Buffer;
 }
 
 interface ParsedRequest {
-    imageBase64: string;
-    mimeType: string;
+  imageBase64: string;
+  mimeType: string;
 }
 
 function parseMultipartRequest(req: FirebaseRequest): Promise<ParsedRequest> {
@@ -162,7 +162,10 @@ export async function quickScan(
     }
 
     // Quick analyze the food image
-    const result = await quickAnalyzeFood(parsed.imageBase64);
+    const result = await quickAnalyzeFood(parsed.imageBase64, {
+      uid,
+      mimeType: parsed.mimeType,
+    });
 
     res.status(200).json({
       success: true,
